@@ -1,242 +1,144 @@
 package raknet
 
-import (
-    "time"
-)
-
-func (s *Session) HandleGamePacket(packetData []byte) {
-    if len(packetData) < 1 {
+func (s *Session) sendStartGamePacket() {
+    // Generate or get entity ID
+    s.entityID = generateEntityID()
+    
+    startGamePacket := &minecraft.StartGamePacket{
+        EntityID:              s.entityID,
+        RuntimeEntityID:       uint64(s.entityID),
+        PlayerGameType:        1, // Survival
+        PlayerPosition:        minecraft.Vector3{X: 0, Y: 70, Z: 0},
+        Rotation:             minecraft.Vector2{X: 0, Y: 0},
+        Seed:                 s.world.GetSeed(),
+        BiomeType:            1,
+        BiomeName:            "plains", 
+        Dimension:            0, // Overworld
+        Generator:            1, // Flat
+        WorldGameMode:        1, // Survival
+        Difficulty:           2, // Normal
+        SpawnPosition:        minecraft.BlockPos{X: 0, Y: 70, Z: 0},
+        AchievementsDisabled: true,
+        Time:                 0,
+        EduMode:              false,
+        CommandsEnabled:      true,
+        TexturePacksRequired: false,
+        GameRules:           []minecraft.GameRule{},
+        Experiments:         []minecraft.Experiment{},
+        ChunkRadius:         4,
+    }
+    
+    packetData, err := minecraft.EncodeStartGamePacket(startGamePacket)
+    if err != nil {
+        log.Printf("Error encoding start game packet: %v", err)
         return
     }
     
-    packetID := packetData[0]
+    s.SendGamePacket(packetData)
     
-    switch packetID {
-    case minecraft.IDLogin:
-        s.handleMinecraftLogin(packetData)
-    case minecraft.IDClientToServerHandshake:
-        s.handleClientHandshake(packetData)
-    case minecraft.IDResourcePackClientResponse:
-        s.handleResourcePackResponse(packetData)
-    case minecraft.IDMovePlayer:
-        s.handleMovePlayer(packetData)
-    case minecraft.IDPlayerAction:
-        s.handlePlayerAction(packetData)
-    default:
-        log.Printf("Unhandled Minecraft packet ID: 0x%02x", packetID)
-    }
+    // Create player entity in world
+    s.createPlayerInWorld()
+    
+    // Send existing entities to player
+    s.sendExistingEntities()
 }
 
-func (s *Session) handleMovePlayer(data []byte) {
-    movePacket, err := minecraft.DecodeMovePlayerPacket(data)
-    if err != nil {
-        log.Printf("Error decoding move player packet: %v", err)
-        return
-    }
-    
-    if movePacket.RuntimeID != uint64(s.entityID) {
-        log.Printf("Move packet for wrong entity: %d != %d", movePacket.RuntimeID, s.entityID)
-        return
-    }
-    
-    // Validate movement with physics
-    if s.validateMovement(movePacket) {
-        // Update player position
-        s.playerEntity.Position = movePacket.Position
-        s.playerEntity.Rotation = movePacket.Rotation
-        
-        // Update chunk coordinates if needed
-        newChunkX := int32(movePacket.Position.X) >> 4
-        newChunkZ := int32(movePacket.Position.Z) >> 4
-        
-        if newChunkX != s.playerEntity.ChunkCoord.X || newChunkZ != s.playerEntity.ChunkCoord.Z {
-            s.playerEntity.ChunkCoord.X = newChunkX
-            s.playerEntity.ChunkCoord.Z = newChunkZ
-            s.world.sendChunksToPlayer(s.playerEntity)
+func (s *Session) sendExistingEntities() {
+    entities := s.world.GetEntityManager().GetEntities()
+    for _, entity := range entities {
+        if entity.Type == world.EntityPlayer && entity.EntityID == s.entityID {
+            continue // Skip self
         }
         
-        // Broadcast movement to other players (would implement later)
-        // s.broadcastMovement(movePacket)
-    } else {
-        // Send correction packet
-        s.sendPositionCorrection()
+        s.sendEntityToClient(entity)
     }
 }
 
-func (s *Session) validateMovement(packet *minecraft.MovePlayerPacket) bool {
-    // Simple validation - check if player is trying to move through blocks
-    currentPos := s.playerEntity.Position
-    newPos := packet.Position
+func (s *Session) sendEntityToClient(entity *world.Entity) {
+    var packetData []byte
+    var err error
     
-    // Calculate movement vector
-    movement := minecraft.Vector3{
-        X: newPos.X - currentPos.X,
-        Y: newPos.Y - currentPos.Y,
-        Z: newPos.Z - currentPos.Z,
-    }
-    
-    // Check for unreasonable movement speed (anti-cheat)
-    movementDistance := math.Sqrt(float64(movement.X*movement.X + movement.Y*movement.Y + movement.Z*movement.Z))
-    if movementDistance > 10.0 { // Max movement per packet
-        log.Printf("Suspicious movement distance: %.2f", movementDistance)
-        return false
-    }
-    
-    // Check collision
-    playerAABB := world.GetPlayerAABB(newPos)
-    if s.world.CheckCollision(playerAABB) {
-        log.Printf("Movement would cause collision")
-        return false
-    }
-    
-    return true
-}
-
-func (s *Session) sendPositionCorrection() {
-    correctionPacket := &minecraft.MovePlayerPacket{
-        RuntimeID: uint64(s.entityID),
-        Position:  s.playerEntity.Position,
-        Rotation:  s.playerEntity.Rotation,
-        Mode:      0, // Normal
-        OnGround:  true,
-        Tick:      uint64(time.Now().UnixNano() / int64(time.Millisecond)),
-    }
-    
-    packetData, err := minecraft.EncodeMovePlayerPacket(correctionPacket)
-    if err != nil {
-        log.Printf("Error encoding position correction: %v", err)
-        return
-    }
-    
-    s.SendGamePacket(packetData)
-}
-
-func (s *Session) handlePlayerAction(data []byte) {
-    actionPacket, err := minecraft.DecodePlayerActionPacket(data)
-    if err != nil {
-        log.Printf("Error decoding player action packet: %v", err)
-        return
-    }
-    
-    if actionPacket.RuntimeID != uint64(s.entityID) {
-        return
-    }
-    
-    switch actionPacket.Action {
-    case 0: // Start break
-        s.handleBlockBreakStart(actionPacket.Position, actionPacket.Face)
-    case 1: // Abort break
-        s.handleBlockBreakAbort(actionPacket.Position)
-    case 2: // Stop break
-        s.handleBlockBreakComplete(actionPacket.Position)
-    case 3: // Get updated block
-        // Handle block update
-    case 4: // Drop item
-        s.handleItemDrop()
-    case 5: // Start sleep
-        // Handle sleep
-    case 6: // Stop sleep
-        // Handle wake up
-    case 7: // Respawn
-        s.handleRespawn()
-    case 8: // Jump
-        // Handle jump
-    case 9: // Start sprint
-        s.handleSprintStart()
-    case 10: // Stop sprint
-        s.handleSprintStop()
-    case 11: // Start sneak
-        s.handleSneakStart()
-    case 12: // Stop sneak
-        s.handleSneakStop()
+    switch entity.Type {
+    case world.EntityItem:
+        packetData, err = s.encodeItemEntityPacket(entity)
     default:
-        log.Printf("Unknown player action: %d", actionPacket.Action)
-    }
-}
-
-func (s *Session) handleBlockBreakStart(pos minecraft.BlockPos, face int32) {
-    log.Printf("Player started breaking block at %d,%d,%d", pos.X, pos.Y, pos.Z)
-    
-    // Convert to world coordinates
-    chunkX := pos.X >> 4
-    chunkZ := pos.Z >> 4
-    localX := pos.X & 0xF
-    localZ := pos.Z & 0xF
-    
-    chunk := s.world.GetChunk(chunkX, chunkZ)
-    block := chunk.GetBlock(localX, pos.Y, localZ)
-    
-    if block.ID == 0 { // Air
-        return
+        packetData, err = s.encodeMobEntityPacket(entity)
     }
     
-    // Send block break animation to other players
-    // s.broadcastBlockBreakAnimation(pos, face)
-}
-
-func (s *Session) handleBlockBreakComplete(pos minecraft.BlockPos) {
-    log.Printf("Player completed breaking block at %d,%d,%d", pos.X, pos.Y, pos.Z)
-    
-    // Convert to world coordinates
-    chunkX := pos.X >> 4
-    chunkZ := pos.Z >> 4
-    localX := pos.X & 0xF
-    localZ := pos.Z & 0xF
-    
-    chunk := s.world.GetChunk(chunkX, chunkZ)
-    
-    // Set block to air
-    chunk.SetBlock(localX, pos.Y, localZ, world.Block{ID: 0, Data: 0})
-    
-    // Send block update to all players
-    s.broadcastBlockUpdate(pos, 0)
-}
-
-func (s *Session) broadcastBlockUpdate(pos minecraft.BlockPos, blockID uint32) {
-    updatePacket := &minecraft.UpdateBlockPacket{
-        Position: pos,
-        BlockID:  blockID,
-        Flags:    1, // Network
-        Layer:    0, // Normal layer
-    }
-    
-    packetData, err := minecraft.EncodeUpdateBlockPacket(updatePacket)
     if err != nil {
-        log.Printf("Error encoding block update: %v", err)
+        log.Printf("Error encoding entity packet: %v", err)
         return
     }
     
-    // Broadcast to all players in world (simplified - just send to self for now)
     s.SendGamePacket(packetData)
 }
 
-func (s *Session) handleRespawn() {
-    log.Printf("Player respawning")
+func (s *Session) encodeMobEntityPacket(entity *world.Entity) ([]byte, error) {
+    entityType := s.getEntityTypeString(entity.Type)
     
-    // Reset player position
-    s.playerEntity.Position = minecraft.Vector3{X: 0, Y: 70, Z: 0}
-    s.playerEntity.Rotation = minecraft.Vector2{X: 0, Y: 0}
+    packet := &minecraft.AddActorPacket{
+        RuntimeID: entity.RuntimeID,
+        Type:      entityType,
+        Position:  entity.Position,
+        Motion:    entity.Motion,
+        Rotation:  entity.Rotation,
+        Attributes: []minecraft.EntityAttribute{
+            {
+                Name:      "minecraft:health",
+                MinValue:  0.0,
+                MaxValue:  entity.MaxHealth,
+                Value:     entity.Health,
+                Default:   entity.MaxHealth,
+            },
+        },
+    }
     
-    // Send new position
-    s.sendPositionCorrection()
+    return minecraft.EncodeAddActorPacket(packet)
 }
 
-func (s *Session) handleSprintStart() {
-    log.Printf("Player started sprinting")
+func (s *Session) encodeItemEntityPacket(entity *world.Entity) ([]byte, error) {
+    itemData, ok := entity.Data.(*world.ItemEntityData)
+    if !ok {
+        return nil, fmt.Errorf("entity is not an item entity")
+    }
+    
+    packet := &minecraft.AddItemActorPacket{
+        RuntimeID: entity.RuntimeID,
+        Item: &minecraft.ItemStack{
+            ID:     uint16(itemData.ItemStack.ID),
+            Count:  itemData.ItemStack.Count,
+            Damage: uint16(itemData.ItemStack.Damage),
+        },
+        Position: entity.Position,
+        Motion:   entity.Motion,
+    }
+    
+    // Use AddActor packet for item entities for now
+    // TODO: Implement proper AddItemActor packet encoding
+    return s.encodeMobEntityPacket(entity)
 }
 
-func (s *Session) handleSprintStop() {
-    log.Printf("Player stopped sprinting")
-}
-
-func (s *Session) handleSneakStart() {
-    log.Printf("Player started sneaking")
-}
-
-func (s *Session) handleSneakStop() {
-    log.Printf("Player stopped sneaking")
-}
-
-func (s *Session) handleItemDrop() {
-    log.Printf("Player dropped item")
+func (s *Session) getEntityTypeString(entityType world.EntityType) string {
+    switch entityType {
+    case world.EntityZombie:
+        return "minecraft:zombie"
+    case world.EntitySkeleton:
+        return "minecraft:skeleton"
+    case world.EntityCreeper:
+        return "minecraft:creeper"
+    case world.EntitySpider:
+        return "minecraft:spider"
+    case world.EntityCow:
+        return "minecraft:cow"
+    case world.EntityPig:
+        return "minecraft:pig"
+    case world.EntitySheep:
+        return "minecraft:sheep"
+    case world.EntityChicken:
+        return "minecraft:chicken"
+    case world.EntityItem:
+        return "minecraft:item"
+    default:
+        return "minecraft:zombie"
+    }
 }

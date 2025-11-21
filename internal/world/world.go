@@ -1,108 +1,137 @@
 package world
 
 import (
-    "sync"
-    "github.com/anabex-dev/garuda/internal/protocol/minecraft"
+    "math/rand"
+    "time"
 )
 
 type World struct {
-    name      string
-    seed      int64
-    chunks    map[ChunkCoord]*Chunk
-    chunksMutex sync.RWMutex
-    players   map[int64]*Player
+    name         string
+    seed         int64
+    chunks       map[ChunkCoord]*Chunk
+    chunksMutex  sync.RWMutex
+    players      map[int64]*Player
     playersMutex sync.RWMutex
-    generator Generator
-}
-
-type ChunkCoord struct {
-    X int32
-    Z int32
-}
-
-type Player struct {
-    EntityID      int64
-    RuntimeID     uint64
-    Username      string
-    Position      minecraft.Vector3
-    Rotation      minecraft.Vector2
-    GameMode      int32
-    ChunkCoord    ChunkCoord
+    generator    Generator
+    entityManager *EntityManager
+    random       *rand.Rand
+    time         int64
+    running      bool
 }
 
 func NewWorld(name string, seed int64) *World {
-    return &World{
+    world := &World{
         name:      name,
         seed:      seed,
         chunks:    make(map[ChunkCoord]*Chunk),
         players:   make(map[int64]*Player),
         generator: NewFlatGenerator(),
+        random:    rand.New(rand.NewSource(seed)),
+        time:      0,
+        running:   true,
+    }
+    
+    world.entityManager = NewEntityManager(world)
+    
+    // Start world tick loop
+    go world.tickLoop()
+    
+    return world
+}
+
+func (w *World) tickLoop() {
+    ticker := time.NewTicker(50 * time.Millisecond) // 20 ticks per second
+    defer ticker.Stop()
+    
+    for w.running {
+        <-ticker.C
+        w.tick()
     }
 }
 
-func (w *World) AddPlayer(player *Player) {
-    w.playersMutex.Lock()
-    defer w.playersMutex.Unlock()
+func (w *World) tick() {
+    w.time++
     
-    w.players[player.EntityID] = player
-    w.sendChunksToPlayer(player)
-}
-
-func (w *World) RemovePlayer(entityID int64) {
-    w.playersMutex.Lock()
-    defer w.playersMutex.Unlock()
+    // Update entities
+    w.entityManager.Update()
     
-    delete(w.players, entityID)
-}
-
-func (w *World) GetPlayer(entityID int64) *Player {
-    w.playersMutex.RLock()
-    defer w.playersMutex.RUnlock()
-    
-    return w.players[entityID]
-}
-
-func (w *World) GetChunk(x, z int32) *Chunk {
-    coord := ChunkCoord{X: x, Z: z}
-    
-    w.chunksMutex.RLock()
-    chunk, exists := w.chunks[coord]
-    w.chunksMutex.RUnlock()
-    
-    if exists {
-        return chunk
+    // Natural mob spawning
+    if w.time%200 == 0 { // Every 10 seconds
+        w.naturalMobSpawning()
     }
-    
-    // Generate new chunk
-    return w.generateChunk(x, z)
 }
 
-func (w *World) generateChunk(x, z int32) *Chunk {
-    chunk := w.generator.GenerateChunk(x, z)
-    
-    w.chunksMutex.Lock()
-    w.chunks[ChunkCoord{X: x, Z: z}] = chunk
-    w.chunksMutex.Unlock()
-    
-    return chunk
-}
-
-func (w *World) sendChunksToPlayer(player *Player) {
-    // Send chunks around player
-    centerX := player.ChunkCoord.X
-    centerZ := player.ChunkCoord.Z
-    radius := int32(2) // 5x5 chunk area
-    
-    for x := centerX - radius; x <= centerX + radius; x++ {
-        for z := centerZ - radius; z <= centerZ + radius; z++ {
-            chunk := w.GetChunk(x, z)
-            // Send chunk to player (implement later)
-            w.sendChunkToPlayer(player, chunk)
+func (w *World) naturalMobSpawning() {
+    // Simple mob spawning - spawn near players
+    for _, player := range w.players {
+        if w.random.Float32() < 0.3 { // 30% chance per player
+            // Spawn position near player
+            angle := w.random.Float64() * 2 * math.Pi
+            distance := 10 + w.random.Float64()*10
+            x := player.Position.X + float32(math.Cos(angle)*distance)
+            z := player.Position.Z + float32(math.Sin(angle)*distance)
+            
+            // Find ground level
+            y := w.findGroundLevel(int32(x), int32(z))
+            
+            if y > 0 {
+                // Random mob type
+                mobTypes := []EntityType{EntityZombie, EntitySkeleton, EntityCreeper, EntitySpider}
+                mobType := mobTypes[w.random.Intn(len(mobTypes))]
+                
+                w.entityManager.CreateEntity(mobType, minecraft.Vector3{
+                    X: x,
+                    Y: float32(y) + 1.0,
+                    Z: z,
+                })
+            }
+        }
+        
+        // Spawn passive mobs occasionally
+        if w.random.Float32() < 0.1 { // 10% chance
+            angle := w.random.Float64() * 2 * math.Pi
+            distance := 15 + w.random.Float64()*15
+            x := player.Position.X + float32(math.Cos(angle)*distance)
+            z := player.Position.Z + float32(math.Sin(angle)*distance)
+            
+            y := w.findGroundLevel(int32(x), int32(z))
+            if y > 0 {
+                passiveTypes := []EntityType{EntityCow, EntityPig, EntitySheep, EntityChicken}
+                mobType := passiveTypes[w.random.Intn(len(passiveTypes))]
+                
+                w.entityManager.CreateEntity(mobType, minecraft.Vector3{
+                    X: x,
+                    Y: float32(y) + 1.0,
+                    Z: z,
+                })
+            }
         }
     }
 }
 
-func (w *World) sendChunkToPlayer(player *Player, chunk *Chunk) {
-    // TODO: Implement chunk packet sending
-    // This will use LevelChunkPacket
+func (w *World) findGroundLevel(x, z int32) int32 {
+    chunkX := x >> 4
+    chunkZ := z >> 4
+    localX := x & 0xF
+    localZ := z & 0xF
+    
+    chunk := w.GetChunk(chunkX, chunkZ)
+    
+    // Find highest non-air block
+    for y := ChunkHeight - 1; y >= 0; y-- {
+        block := chunk.GetBlock(localX, int32(y), localZ)
+        if block.ID != 0 { // Not air
+            return int32(y)
+        }
+    }
+    
+    return -1
+}
+
+func (w *World) GetEntityManager() *EntityManager {
+    return w.entityManager
+}
+
+func (w *World) Stop() {
+    w.running = false
 }
