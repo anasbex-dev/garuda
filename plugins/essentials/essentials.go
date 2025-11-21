@@ -4,9 +4,9 @@ import (
     "log"
     "strings"
 
-    "github.com/anabex-dev/garuda/internal/protocol/minecraft"
-    "github.com/anabex-dev/garuda/internal/world"
-    "github.com/anabex-dev/garuda/pkg/plugin"
+    "garuda/internal/protocol/minecraft"
+    "garuda/internal/world"
+    "garuda/pkg/plugin"
 )
 
 // EssentialsPlugin provides basic server commands and features

@@ -12,8 +12,8 @@ import (
     "sync/atomic"
     "time"
 
-    "github.com/anabex-dev/garuda/internal/world"
-    "github.com/anabex-dev/garuda/pkg/plugin"
+    "garuda/internal/world"
+    "garuda/pkg/plugin"
 )
 
 // RakNetServer represents the main RakNet server implementation

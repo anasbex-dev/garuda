@@ -9,8 +9,8 @@ import (
     "time"
 
     "github.com/gorilla/mux"
-    "github.com/anabex-dev/garuda/internal/server"
-    "github.com/anabex-dev/garuda/internal/world"
+    "garuda/internal/server"
+    "garuda/internal/world"
 )
 
 // APIServer represents the REST API server

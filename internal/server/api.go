@@ -8,9 +8,9 @@ import (
     "sync"
     "time"
 
-    "github.com/anabex-dev/garuda/internal/protocol/minecraft"
-    "github.com/anabex-dev/garuda/internal/world"
-    "github.com/anabex-dev/garuda/pkg/plugin"
+    "garuda/internal/protocol/minecraft"
+    "garuda/internal/world"
+    "garuda/pkg/plugin"
 )
 
 // GarudaServer implements the main server API for plugins and systems

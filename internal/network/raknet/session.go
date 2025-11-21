@@ -10,8 +10,8 @@ import (
     "sync"
     "time"
 
-    "github.com/anabex-dev/garuda/internal/protocol/minecraft"
-    "github.com/anabex-dev/garuda/internal/world"
+    "garuda/internal/protocol/minecraft"
+    "garuda/internal/world"
 )
 
 type SessionState int

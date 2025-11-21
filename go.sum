@@ -1,8 +1,0 @@
-github.com/gorilla/mux v1.8.0 h1:TuBL49tXwgrFYWhqrNgrUNEY92u81SPhu7sTdzQEiWY=
-github.com/gorilla/mux v1.8.0/go.mod h1:Vb8rUbK1GtD8HsVlT8GtmA6H+oJ6Z8p+ouICLbaO680=
-
-go.uber.org/multierr v1.10.0 h1:blXXPk7nzWv0nq2V8fLPc3d1ceCRk+6Vr1fwlfFl/8c=
-go.uber.org/multierr v1.10.0/go.mod h1:20+Q6messiFwn2LXAiD1A2xK9fY1F0OqPJEU9gZxLpc=
-
-go.uber.org/zap v1.25.0 h1:ZcyMr0w2SzBSJ2qPXFrNn6M4JIUQKFF+8tujdK1vLcs=
-go.uber.org/zap v1.25.0/go.mod h1:Yq9L1+4oGK6JVRu0VrxxYcO1dJm2kX6L4kYx0kM92wA=

@@ -12,12 +12,12 @@ import (
     "syscall"
     "time"
 
-    "github.com/anabex-dev/garuda/internal/config"
-    "github.com/anabex-dev/garuda/internal/network/raknet"
-    "github.com/anabex-dev/garuda/internal/server"
-    "github.com/anabex-dev/garuda/internal/world"
-    "github.com/anabex-dev/garuda/pkg/plugin"
-    "github.com/anabex-dev/garuda/api"
+    "garuda/internal/config"
+    "garuda/internal/network/raknet"
+    "garuda/internal/server"
+    "garuda/internal/world"
+    "garuda/pkg/plugin"
+    "garuda/api"
 )
 
 var (

@@ -7,7 +7,7 @@ import (
     "sync"
     "time"
 
-    "github.com/anabex-dev/garuda/internal/protocol/minecraft"
+    "garuda/internal/protocol/minecraft"
 )
 
 type World struct {
