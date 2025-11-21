@@ -1,312 +1,239 @@
 package plugin
 
 import (
-    "fmt"
-    "log"
-    "os"
-    "path/filepath"
-    "plugin"
+    "garuda/minecraft/server"
+    "garuda/pkg/utils"
+    "garuda/world"
     "sync"
-
-    "github.com/anabex-dev/garuda/internal/protocol/minecraft"
-    "github.com/anabex-dev/garuda/internal/world"
 )
 
-type PluginManager struct {
+type PluginManagerImpl struct {
+    server      *server.Server
+    logger      *utils.Logger
     plugins     map[string]Plugin
-    enabled     map[string]bool
+    eventHandlers map[EventType][]EventHandler
+    commands    map[string]CommandHandler
+    scheduler   *SimpleScheduler
+    permissions *SimplePermissionManager
     mutex       sync.RWMutex
-    pluginsDir  string
-    server      ServerAPI
 }
 
-type ServerAPI interface {
-    BroadcastMessage(message string)
-    GetPlayer(name string) *world.Player
-    GetOnlinePlayers() []*world.Player
-    ExecuteCommand(command string) bool
-    GetWorld() *world.World
-}
-
-func NewPluginManager(pluginsDir string, server ServerAPI) *PluginManager {
-    return &PluginManager{
-        plugins:    make(map[string]Plugin),
-        enabled:    make(map[string]bool),
-        pluginsDir: pluginsDir,
-        server:     server,
+func NewPluginManager(server *server.Server, logger *utils.Logger) *PluginManagerImpl {
+    return &PluginManagerImpl{
+        server:      server,
+        logger:      logger,
+        plugins:     make(map[string]Plugin),
+        eventHandlers: make(map[EventType][]EventHandler),
+        commands:    make(map[string]CommandHandler),
+        scheduler:   NewSimpleScheduler(),
+        permissions: NewSimplePermissionManager(),
     }
 }
 
-func (pm *PluginManager) LoadAllPlugins() error {
-    // Create plugins directory if it doesn't exist
-    if err := os.MkdirAll(pm.pluginsDir, 0755); err != nil {
-        return fmt.Errorf("could not create plugins directory: %v", err)
-    }
-
-    // Load from compiled .so files
-    return filepath.Walk(pm.pluginsDir, func(path string, info os.FileInfo, err error) error {
-        if err != nil {
-            return err
-        }
-
-        if info.IsDir() || filepath.Ext(path) != ".so" {
-            return nil
-        }
-
-        return pm.LoadPlugin(path)
-    })
-}
-
-func (pm *PluginManager) LoadPlugin(path string) error {
+func (pm *PluginManagerImpl) LoadPlugin(plugin Plugin) bool {
     pm.mutex.Lock()
     defer pm.mutex.Unlock()
-
-    // Open the plugin file
-    plug, err := plugin.Open(path)
-    if err != nil {
-        return fmt.Errorf("could not open plugin %s: %v", path, err)
-    }
-
-    // Look up the symbol "PluginInstance"
-    symPlugin, err := plug.Lookup("PluginInstance")
-    if err != nil {
-        return fmt.Errorf("plugin %s does not export PluginInstance: %v", path, err)
-    }
-
-    // Assert that it implements the Plugin interface
-    p, ok := symPlugin.(Plugin)
-    if !ok {
-        return fmt.Errorf("plugin %s does not implement Plugin interface", path)
-    }
-
-    pluginName := p.GetName()
     
-    // Check if plugin already loaded
+    pluginName := plugin.GetName()
+    
     if _, exists := pm.plugins[pluginName]; exists {
-        return fmt.Errorf("plugin %s already loaded", pluginName)
+        pm.logger.Error("Plugin %s is already loaded", pluginName)
+        return false
     }
-
-    // Store the plugin
-    pm.plugins[pluginName] = p
-    log.Printf("Loaded plugin: %s v%s by %s", pluginName, p.GetVersion(), p.GetAuthor())
-
-    return nil
+    
+    pm.plugins[pluginName] = plugin
+    
+    pm.logger.Info("Loading plugin: %s v%s by %s", 
+        plugin.GetName(), plugin.GetVersion(), plugin.GetAuthor())
+    
+    plugin.OnEnable(pm)
+    
+    pm.logger.Info("Plugin %s enabled successfully", pluginName)
+    return true
 }
 
-func (pm *PluginManager) EnablePlugin(name string) error {
+func (pm *PluginManagerImpl) UnloadPlugin(name string) bool {
     pm.mutex.Lock()
     defer pm.mutex.Unlock()
-
-    p, exists := pm.plugins[name]
+    
+    plugin, exists := pm.plugins[name]
     if !exists {
-        return fmt.Errorf("plugin %s not found", name)
+        pm.logger.Error("Plugin %s is not loaded", name)
+        return false
     }
-
-    if pm.enabled[name] {
-        return fmt.Errorf("plugin %s already enabled", name)
-    }
-
-    // Enable the plugin
-    p.OnEnable(pm)
-    pm.enabled[name] = true
-
-    log.Printf("Enabled plugin: %s", name)
-    return nil
-}
-
-func (pm *PluginManager) EnableAllPlugins() {
-    pm.mutex.Lock()
-    defer pm.mutex.Unlock()
-
-    for name, p := range pm.plugins {
-        if !pm.enabled[name] {
-            p.OnEnable(pm)
-            pm.enabled[name] = true
-            log.Printf("Enabled plugin: %s", name)
-        }
-    }
-}
-
-func (pm *PluginManager) DisablePlugin(name string) error {
-    pm.mutex.Lock()
-    defer pm.mutex.Unlock()
-
-    p, exists := pm.plugins[name]
-    if !exists {
-        return fmt.Errorf("plugin %s not found", name)
-    }
-
-    if !pm.enabled[name] {
-        return fmt.Errorf("plugin %s not enabled", name)
-    }
-
-    // Disable the plugin
-    p.OnDisable()
-    delete(pm.enabled, name)
-
-    log.Printf("Disabled plugin: %s", name)
-    return nil
-}
-
-func (pm *PluginManager) DisableAllPlugins() {
-    pm.mutex.Lock()
-    defer pm.mutex.Unlock()
-
-    for name, p := range pm.plugins {
-        if pm.enabled[name] {
-            p.OnDisable()
-            delete(pm.enabled, name)
-            log.Printf("Disabled plugin: %s", name)
-        }
-    }
-}
-
-func (pm *PluginManager) UnloadPlugin(name string) error {
-    if err := pm.DisablePlugin(name); err != nil {
-        return err
-    }
-
-    pm.mutex.Lock()
-    defer pm.mutex.Unlock()
-
+    
+    plugin.OnDisable()
     delete(pm.plugins, name)
-    log.Printf("Unloaded plugin: %s", name)
-    return nil
+    
+    pm.scheduler.CancelTasks(plugin)
+    
+    pm.logger.Info("Plugin %s unloaded successfully", name)
+    return true
 }
 
-func (pm *PluginManager) GetPlugin(name string) Plugin {
+func (pm *PluginManagerImpl) GetPlugin(name string) Plugin {
     pm.mutex.RLock()
     defer pm.mutex.RUnlock()
-
+    
     return pm.plugins[name]
 }
 
-func (pm *PluginManager) GetPlugins() []Plugin {
+func (pm *PluginManagerImpl) GetPlugins() []Plugin {
     pm.mutex.RLock()
     defer pm.mutex.RUnlock()
-
+    
     plugins := make([]Plugin, 0, len(pm.plugins))
-    for _, p := range pm.plugins {
-        plugins = append(plugins, p)
+    for _, plugin := range pm.plugins {
+        plugins = append(plugins, plugin)
     }
     return plugins
 }
 
-func (pm *PluginManager) IsEnabled(name string) bool {
-    pm.mutex.RLock()
-    defer pm.mutex.RUnlock()
-
-    return pm.enabled[name]
+func (pm *PluginManagerImpl) RegisterEvent(eventType EventType, handler EventHandler) {
+    pm.mutex.Lock()
+    defer pm.mutex.Unlock()
+    
+    pm.eventHandlers[eventType] = append(pm.eventHandlers[eventType], handler)
+    pm.logger.Debug("Registered event handler for %v", eventType)
 }
 
-// Event dispatching methods
-func (pm *PluginManager) DispatchPlayerJoin(player *world.Player) {
-    pm.mutex.RLock()
-    defer pm.mutex.RUnlock()
+func (pm *PluginManagerImpl) RegisterCommand(command string, handler CommandHandler) {
+    pm.mutex.Lock()
+    defer pm.mutex.Unlock()
+    
+    pm.commands[command] = handler
+    pm.logger.Debug("Registered command: /%s", command)
+}
 
-    for name, p := range pm.plugins {
-        if pm.enabled[name] {
-            if handler, ok := p.(EventHandler); ok {
-                handler.OnPlayerJoin(player)
-            }
+func (pm *PluginManagerImpl) CallEvent(event Event) {
+    pm.mutex.RLock()
+    handlers, exists := pm.eventHandlers[event.GetType()]
+    pm.mutex.RUnlock()
+    
+    if !exists {
+        return
+    }
+    
+    for _, handler := range handlers {
+        handler(event)
+        if event.IsCancelled() {
+            break
         }
     }
 }
 
-func (pm *PluginManager) DispatchPlayerQuit(player *world.Player) {
+func (pm *PluginManagerImpl) ExecuteCommand(sender CommandSender, commandLine string) bool {
     pm.mutex.RLock()
     defer pm.mutex.RUnlock()
-
-    for name, p := range pm.plugins {
-        if pm.enabled[name] {
-            if handler, ok := p.(EventHandler); ok {
-                handler.OnPlayerQuit(player)
-            }
-        }
+    
+    command, args := parseCommand(commandLine)
+    
+    handler, exists := pm.commands[command]
+    if !exists {
+        sender.SendMessage("Unknown command: " + command)
+        return false
     }
+    
+    return handler(sender, command, args)
 }
 
-func (pm *PluginManager) DispatchPlayerChat(player *world.Player, message string) bool {
-    pm.mutex.RLock()
-    defer pm.mutex.RUnlock()
-
-    allowChat := true
-    for name, p := range pm.plugins {
-        if pm.enabled[name] {
-            if handler, ok := p.(EventHandler); ok {
-                if !handler.OnPlayerChat(player, message) {
-                    allowChat = false
-                }
+func parseCommand(commandLine string) (string, []string) {
+    if len(commandLine) == 0 {
+        return "", nil
+    }
+    
+    if commandLine[0] == '/' {
+        commandLine = commandLine[1:]
+    }
+    
+    var parts []string
+    var current string
+    inQuotes := false
+    
+    for _, char := range commandLine {
+        if char == '"' {
+            inQuotes = !inQuotes
+        } else if char == ' ' && !inQuotes {
+            if current != "" {
+                parts = append(parts, current)
+                current = ""
             }
+        } else {
+            current += string(char)
         }
     }
-    return allowChat
+    
+    if current != "" {
+        parts = append(parts, current)
+    }
+    
+    if len(parts) == 0 {
+        return "", nil
+    }
+    
+    return parts[0], parts[1:]
 }
 
-func (pm *PluginManager) DispatchPlayerMove(player *world.Player, from, to minecraft.Vector3) bool {
-    pm.mutex.RLock()
-    defer pm.mutex.RUnlock()
-
-    allowMove := true
-    for name, p := range pm.plugins {
-        if pm.enabled[name] {
-            if handler, ok := p.(EventHandler); ok {
-                if !handler.OnPlayerMove(player, from, to) {
-                    allowMove = false
-                }
-            }
-        }
-    }
-    return allowMove
+func (pm *PluginManagerImpl) GetServer() Server {
+    return pm.server
 }
 
-func (pm *PluginManager) DispatchBlockBreak(player *world.Player, pos minecraft.BlockPos, block world.Block) bool {
-    pm.mutex.RLock()
-    defer pm.mutex.RUnlock()
-
-    allowBreak := true
-    for name, p := range pm.plugins {
-        if pm.enabled[name] {
-            if handler, ok := p.(EventHandler); ok {
-                if !handler.OnBlockBreak(player, pos, block) {
-                    allowBreak = false
-                }
-            }
-        }
-    }
-    return allowBreak
+func (pm *PluginManagerImpl) BroadcastMessage(message string) {
+    pm.server.BroadcastMessage(message)
 }
 
-func (pm *PluginManager) DispatchBlockPlace(player *world.Player, pos minecraft.BlockPos, block world.Block) bool {
-    pm.mutex.RLock()
-    defer pm.mutex.RUnlock()
-
-    allowPlace := true
-    for name, p := range pm.plugins {
-        if pm.enabled[name] {
-            if handler, ok := p.(EventHandler); ok {
-                if !handler.OnBlockPlace(player, pos, block) {
-                    allowPlace = false
-                }
-            }
-        }
-    }
-    return allowPlace
+func (pm *PluginManagerImpl) GetPlayer(name string) world.Player {
+    // This will be implemented when we integrate with server
+    return nil
 }
 
-func (pm *PluginManager) DispatchPlayerCommand(player *world.Player, command string, args []string) bool {
-    pm.mutex.RLock()
-    defer pm.mutex.RUnlock()
+func (pm *PluginManagerImpl) GetOnlinePlayers() []world.Player {
+    // This will be implemented when we integrate with server
+    return nil
+}
 
-    allowCommand := true
-    for name, p := range pm.plugins {
-        if pm.enabled[name] {
-            if handler, ok := p.(EventHandler); ok {
-                if !handler.OnPlayerCommand(player, command, args) {
-                    allowCommand = false
-                }
-            }
-        }
-    }
-    return allowCommand
+func (pm *PluginManagerImpl) Tick() {
+    pm.scheduler.Tick()
+}
+
+func (pm *PluginManagerImpl) GetScheduler() *SimpleScheduler {
+    return pm.scheduler
+}
+
+func (pm *PluginManagerImpl) GetPermissionManager() *SimplePermissionManager {
+    return pm.permissions
+}
+
+func (pm *PluginManagerImpl) DispatchPlayerJoin(player world.Player) {
+    event := &PlayerJoinEvent{Player: player}
+    pm.CallEvent(event)
+}
+
+func (pm *PluginManagerImpl) DispatchPlayerQuit(player world.Player, reason string) {
+    event := &PlayerQuitEvent{Player: player, Reason: reason}
+    pm.CallEvent(event)
+}
+
+func (pm *PluginManagerImpl) DispatchPlayerChat(player world.Player, message string) *PlayerChatEvent {
+    event := &PlayerChatEvent{Player: player, Message: message}
+    pm.CallEvent(event)
+    return event
+}
+
+func (pm *PluginManagerImpl) DispatchPlayerMove(player world.Player, fromPos, toPos [3]float32) *PlayerMoveEvent {
+    event := &PlayerMoveEvent{Player: player, FromPos: fromPos, ToPos: toPos}
+    pm.CallEvent(event)
+    return event
+}
+
+func (pm *PluginManagerImpl) DispatchPlayerBreakBlock(player world.Player, blockPos [3]int, blockID uint32) *PlayerBreakBlockEvent {
+    event := &PlayerBreakBlockEvent{Player: player, BlockPos: blockPos, BlockID: blockID}
+    pm.CallEvent(event)
+    return event
+}
+
+func (pm *PluginManagerImpl) DispatchPlayerPlaceBlock(player world.Player, blockPos [3]int, blockID uint32) *PlayerPlaceBlockEvent {
+    event := &PlayerPlaceBlockEvent{Player: player, BlockPos: blockPos, BlockID: blockID}
+    pm.CallEvent(event)
+    return event
 }

@@ -1,204 +1,409 @@
 package world
 
 import (
-    "sync"
+    "sort"
+)
+
+type InventoryType int
+
+const (
+    InventoryPlayer InventoryType = iota
+    InventoryChest
+    InventoryFurnace
+    InventoryCrafting
+    InventoryEnchanting
+    InventoryEnderChest
 )
 
 type Inventory struct {
-    items      []*ItemStack
-    heldSlot   int
-    size       int
-    mutex      sync.RWMutex
+    Type     InventoryType
+    Size     int
+    Items    []ItemStack
+    Title    string
+    mutex    sync.RWMutex
 }
 
-type ItemStack struct {
-    ID     uint16
-    Count  byte
-    Damage uint16
-    NBT    map[string]interface{}
+type InventoryManager struct {
+    inventories map[string]*Inventory
+    mutex       sync.RWMutex
+    logger      *utils.Logger
 }
 
-type ItemRegistry struct {
-    items map[uint16]*ItemType
-    mutex sync.RWMutex
+func NewInventoryManager(logger *utils.Logger) *InventoryManager {
+    return &InventoryManager{
+        inventories: make(map[string]*Inventory),
+        logger:      logger,
+    }
 }
 
-type ItemType struct {
-    ID          uint16
-    Name        string
-    MaxStackSize byte
-    Durability  uint16
-}
-
-func NewInventory(size int) *Inventory {
-    items := make([]*ItemStack, size)
-    for i := range items {
-        items[i] = &ItemStack{ID: 0, Count: 0} // Empty slots
+func NewPlayerInventory() *Inventory {
+    inv := &Inventory{
+        Type:  InventoryPlayer,
+        Size:  36, // 27 inventory + 9 hotbar
+        Items: make([]ItemStack, 36),
+        Title: "Inventory",
     }
     
-    return &Inventory{
-        items:    items,
-        size:     size,
-        heldSlot: 0,
+    // Initialize empty slots
+    for i := range inv.Items {
+        inv.Items[i] = ItemStack{ID: 0, Count: 0, Data: 0}
     }
+    
+    return inv
 }
 
-func (inv *Inventory) GetItem(slot int) *ItemStack {
+func NewChestInventory(size int, title string) *Inventory {
+    if size <= 0 || size > 54 {
+        size = 27 // Default chest size
+    }
+    
+    inv := &Inventory{
+        Type:  InventoryChest,
+        Size:  size,
+        Items: make([]ItemStack, size),
+        Title: title,
+    }
+    
+    for i := range inv.Items {
+        inv.Items[i] = ItemStack{ID: 0, Count: 0, Data: 0}
+    }
+    
+    return inv
+}
+
+func (im *InventoryManager) CreateInventory(invType InventoryType, size int, title string) *Inventory {
+    var inv *Inventory
+    
+    switch invType {
+    case InventoryPlayer:
+        inv = NewPlayerInventory()
+    case InventoryChest:
+        inv = NewChestInventory(size, title)
+    default:
+        inv = &Inventory{
+            Type:  invType,
+            Size:  size,
+            Items: make([]ItemStack, size),
+            Title: title,
+        }
+        
+        for i := range inv.Items {
+            inv.Items[i] = ItemStack{ID: 0, Count: 0, Data: 0}
+        }
+    }
+    
+    // Generate unique ID
+    invID := im.generateInventoryID()
+    
+    im.mutex.Lock()
+    im.inventories[invID] = inv
+    im.mutex.Unlock()
+    
+    return inv
+}
+
+func (im *InventoryManager) generateInventoryID() string {
+    // Simple ID generation - bisa diimprove dengan UUID
+    return fmt.Sprintf("inv_%d", len(im.inventories)+1)
+}
+
+func (im *InventoryManager) GetInventory(invID string) *Inventory {
+    im.mutex.RLock()
+    defer im.mutex.RUnlock()
+    
+    return im.inventories[invID]
+}
+
+func (im *InventoryManager) RemoveInventory(invID string) {
+    im.mutex.Lock()
+    defer im.mutex.Unlock()
+    
+    delete(im.inventories, invID)
+}
+
+func (inv *Inventory) GetItem(slot int) ItemStack {
     inv.mutex.RLock()
     defer inv.mutex.RUnlock()
     
-    if slot < 0 || slot >= inv.size {
-        return nil
+    if slot < 0 || slot >= len(inv.Items) {
+        return ItemStack{ID: 0, Count: 0, Data: 0}
     }
-    return inv.items[slot]
+    
+    return inv.Items[slot]
 }
 
-func (inv *Inventory) SetItem(slot int, item *ItemStack) bool {
+func (inv *Inventory) SetItem(slot int, item ItemStack) bool {
     inv.mutex.Lock()
     defer inv.mutex.Unlock()
     
-    if slot < 0 || slot >= inv.size {
+    if slot < 0 || slot >= len(inv.Items) {
         return false
     }
     
-    inv.items[slot] = item
+    inv.Items[slot] = item
     return true
 }
 
-func (inv *Inventory) AddItem(item *ItemStack) bool {
+func (inv *Inventory) AddItem(item ItemStack) (remaining ItemStack, added bool) {
     inv.mutex.Lock()
     defer inv.mutex.Unlock()
     
-    // Try to stack with existing items first
-    for i, existing := range inv.items {
-        if existing.ID == item.ID && existing.Damage == item.Damage && existing.Count < 64 {
-            space := 64 - existing.Count
-            if item.Count <= space {
-                existing.Count += item.Count
-                return true
-            } else {
-                existing.Count = 64
-                item.Count -= space
+    remaining = item
+    added = false
+    
+    // First try to stack with existing items
+    for i := range inv.Items {
+        if inv.Items[i].ID == item.ID && inv.Items[i].Data == item.Data {
+            space := 64 - inv.Items[i].Count
+            if space > 0 {
+                transfer := byte(min(int(item.Count), int(space)))
+                inv.Items[i].Count += transfer
+                remaining.Count -= transfer
+                added = true
+                
+                if remaining.Count <= 0 {
+                    return ItemStack{ID: 0, Count: 0, Data: 0}, true
+                }
             }
         }
     }
     
-    // Find empty slot
-    for i, existing := range inv.items {
-        if existing.ID == 0 {
-            inv.items[i] = item
-            return true
+    // Then try to put in empty slots
+    for i := range inv.Items {
+        if inv.Items[i].ID == 0 {
+            inv.Items[i] = remaining
+            return ItemStack{ID: 0, Count: 0, Data: 0}, true
         }
     }
     
-    return false
+    return remaining, added
 }
 
-func (inv *Inventory) RemoveItem(slot int, count byte) *ItemStack {
+func (inv *Inventory) RemoveItem(slot int, count byte) (ItemStack, bool) {
     inv.mutex.Lock()
     defer inv.mutex.Unlock()
     
-    if slot < 0 || slot >= inv.size {
-        return nil
+    if slot < 0 || slot >= len(inv.Items) || inv.Items[slot].ID == 0 {
+        return ItemStack{ID: 0, Count: 0, Data: 0}, false
     }
     
-    item := inv.items[slot]
-    if item.ID == 0 || item.Count == 0 {
-        return nil
-    }
-    
-    if count >= item.Count {
-        // Remove entire stack
-        removed := &ItemStack{
-            ID:     item.ID,
-            Count:  item.Count,
-            Damage: item.Damage,
-            NBT:    item.NBT,
-        }
-        inv.items[slot] = &ItemStack{ID: 0, Count: 0}
-        return removed
+    item := inv.Items[slot]
+    if item.Count <= count {
+        inv.Items[slot] = ItemStack{ID: 0, Count: 0, Data: 0}
+        return item, true
     } else {
-        // Remove partial stack
-        item.Count -= count
-        return &ItemStack{
-            ID:     item.ID,
-            Count:  count,
-            Damage: item.Damage,
-            NBT:    item.NBT,
+        removed := ItemStack{ID: item.ID, Count: count, Data: item.Data}
+        inv.Items[slot].Count -= count
+        return removed, true
+    }
+}
+
+func (inv *Inventory) RemoveItems(itemID uint32, count int) ([]ItemStack, bool) {
+    inv.mutex.Lock()
+    defer inv.mutex.Unlock()
+    
+    removed := make([]ItemStack, 0)
+    remaining := count
+    
+    for i := range inv.Items {
+        if inv.Items[i].ID == itemID && remaining > 0 {
+            available := int(inv.Items[i].Count)
+            take := min(available, remaining)
+            
+            removed = append(removed, ItemStack{
+                ID:    itemID,
+                Count: byte(take),
+                Data:  inv.Items[i].Data,
+            })
+            
+            if take == available {
+                inv.Items[i] = ItemStack{ID: 0, Count: 0, Data: 0}
+            } else {
+                inv.Items[i].Count -= byte(take)
+            }
+            
+            remaining -= take
         }
     }
+    
+    return removed, remaining == 0
 }
 
-func (inv *Inventory) GetHeldItem() *ItemStack {
-    return inv.GetItem(inv.heldSlot)
-}
-
-func (inv *Inventory) SetHeldSlot(slot int) bool {
-    if slot < 0 || slot >= 9 {
-        return false
+func (inv *Inventory) HasItem(itemID uint32, count int) bool {
+    inv.mutex.RLock()
+    defer inv.mutex.RUnlock()
+    
+    total := 0
+    for _, item := range inv.Items {
+        if item.ID == itemID {
+            total += int(item.Count)
+            if total >= count {
+                return true
+            }
+        }
     }
-    inv.heldSlot = slot
+    
+    return total >= count
+}
+
+func (inv *Inventory) CountItem(itemID uint32) int {
+    inv.mutex.RLock()
+    defer inv.mutex.RUnlock()
+    
+    total := 0
+    for _, item := range inv.Items {
+        if item.ID == itemID {
+            total += int(item.Count)
+        }
+    }
+    
+    return total
+}
+
+func (inv *Inventory) FindItem(itemID uint32) []int {
+    inv.mutex.RLock()
+    defer inv.mutex.RUnlock()
+    
+    slots := make([]int, 0)
+    for i, item := range inv.Items {
+        if item.ID == itemID && item.Count > 0 {
+            slots = append(slots, i)
+        }
+    }
+    
+    return slots
+}
+
+func (inv *Inventory) FindEmptySlot() int {
+    inv.mutex.RLock()
+    defer inv.mutex.RUnlock()
+    
+    for i, item := range inv.Items {
+        if item.ID == 0 {
+            return i
+        }
+    }
+    
+    return -1
+}
+
+func (inv *Inventory) IsEmpty() bool {
+    inv.mutex.RLock()
+    defer inv.mutex.RUnlock()
+    
+    for _, item := range inv.Items {
+        if item.ID != 0 {
+            return false
+        }
+    }
+    
     return true
+}
+
+func (inv *Inventory) GetContents() []ItemStack {
+    inv.mutex.RLock()
+    defer inv.mutex.RUnlock()
+    
+    items := make([]ItemStack, len(inv.Items))
+    copy(items, inv.Items)
+    return items
+}
+
+func (inv *Inventory) SetContents(items []ItemStack) {
+    inv.mutex.Lock()
+    defer inv.mutex.Unlock()
+    
+    copy(inv.Items, items)
 }
 
 func (inv *Inventory) SwapSlots(slot1, slot2 int) bool {
     inv.mutex.Lock()
     defer inv.mutex.Unlock()
     
-    if slot1 < 0 || slot1 >= inv.size || slot2 < 0 || slot2 >= inv.size {
+    if slot1 < 0 || slot1 >= len(inv.Items) || slot2 < 0 || slot2 >= len(inv.Items) {
         return false
     }
     
-    inv.items[slot1], inv.items[slot2] = inv.items[slot2], inv.items[slot1]
+    inv.Items[slot1], inv.Items[slot2] = inv.Items[slot2], inv.Items[slot1]
     return true
 }
 
-func NewItemRegistry() *ItemRegistry {
-    registry := &ItemRegistry{
-        items: make(map[uint16]*ItemType),
+func (inv *Inventory) Sort() {
+    inv.mutex.Lock()
+    defer inv.mutex.Unlock()
+    
+    // Sort by item ID, then by data value
+    sort.Slice(inv.Items, func(i, j int) bool {
+        if inv.Items[i].ID == inv.Items[j].ID {
+            return inv.Items[i].Data < inv.Items[j].Data
+        }
+        return inv.Items[i].ID < inv.Items[j].ID
+    })
+    
+    // Compact stacks
+    im.compactStacks(inv)
+}
+
+func (im *InventoryManager) compactStacks(inv *Inventory) {
+    // Group items by type
+    itemsByType := make(map[uint32]map[uint16][]*ItemStack)
+    
+    for i := range inv.Items {
+        item := &inv.Items[i]
+        if item.ID == 0 {
+            continue
+        }
+        
+        if itemsByType[item.ID] == nil {
+            itemsByType[item.ID] = make(map[uint16][]*ItemStack)
+        }
+        
+        itemsByType[item.ID][item.Data] = append(itemsByType[item.ID][item.Data], item)
     }
     
-    registry.RegisterDefaultItems()
-    return registry
+    // Rebuild inventory dengan stacks yang compact
+    newItems := make([]ItemStack, len(inv.Items))
+    slot := 0
+    
+    for itemID, dataMap := range itemsByType {
+        for dataValue, itemList := range dataMap {
+            totalCount := 0
+            for _, item := range itemList {
+                totalCount += int(item.Count)
+            }
+            
+            // Distribute across stacks
+            for totalCount > 0 && slot < len(newItems) {
+                stackSize := min(totalCount, 64)
+                newItems[slot] = ItemStack{
+                    ID:    itemID,
+                    Count: byte(stackSize),
+                    Data:  dataValue,
+                }
+                totalCount -= stackSize
+                slot++
+            }
+        }
+    }
+    
+    // Fill remaining slots with air
+    for i := slot; i < len(newItems); i++ {
+        newItems[i] = ItemStack{ID: 0, Count: 0, Data: 0}
+    }
+    
+    inv.Items = newItems
 }
 
-func (r *ItemRegistry) RegisterItem(item *ItemType) {
-    r.mutex.Lock()
-    defer r.mutex.Unlock()
-    
-    r.items[item.ID] = item
+func min(a, b int) int {
+    if a < b {
+        return a
+    }
+    return b
 }
 
-func (r *ItemRegistry) GetItem(id uint16) *ItemType {
-    r.mutex.RLock()
-    defer r.mutex.RUnlock()
-    
-    return r.items[id]
+func max(a, b int) int {
+    if a > b {
+        return a
+    }
+    return b
 }
-
-func (r *ItemRegistry) RegisterDefaultItems() {
-    // Tools
-    r.RegisterItem(&ItemType{ID: 256, Name: "iron_shovel", MaxStackSize: 1, Durability: 251})
-    r.RegisterItem(&ItemType{ID: 257, Name: "iron_pickaxe", MaxStackSize: 1, Durability: 251})
-    r.RegisterItem(&ItemType{ID: 258, Name: "iron_axe", MaxStackSize: 1, Durability: 251})
-    
-    // Weapons
-    r.RegisterItem(&ItemType{ID: 267, Name: "iron_sword", MaxStackSize: 1, Durability: 251})
-    r.RegisterItem(&ItemType{ID: 268, Name: "wooden_sword", MaxStackSize: 1, Durability: 59})
-    
-    // Blocks
-    r.RegisterItem(&ItemType{ID: 1, Name: "stone", MaxStackSize: 64, Durability: 0})
-    r.RegisterItem(&ItemType{ID: 2, Name: "grass", MaxStackSize: 64, Durability: 0})
-    r.RegisterItem(&ItemType{ID: 3, Name: "dirt", MaxStackSize: 64, Durability: 0})
-    r.RegisterItem(&ItemType{ID: 4, Name: "cobblestone", MaxStackSize: 64, Durability: 0})
-    r.RegisterItem(&ItemType{ID: 5, Name: "oak_wood", MaxStackSize: 64, Durability: 0})
-    r.RegisterItem(&ItemType{ID: 6, Name: "oak_planks", MaxStackSize: 64, Durability: 0})
-    
-    // Resources
-    r.RegisterItem(&ItemType{ID: 263, Name: "coal", MaxStackSize: 64, Durability: 0})
-    r.RegisterItem(&ItemType{ID: 265, Name: "iron_ingot", MaxStackSize: 64, Durability: 0})
-    r.RegisterItem(&ItemType{ID: 266, Name: "gold_ingot", MaxStackSize: 64, Durability: 0})
-    r.RegisterItem(&ItemType{ID: 264, Name: "diamond", MaxStackSize: 64, Durability: 0})
-}
-
-var DefaultItemRegistry = NewItemRegistry()

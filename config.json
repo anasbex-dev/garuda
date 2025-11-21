@@ -1,25 +1,16 @@
 {
-  "address": "0.0.0.0",
-  "port": 19132,
-  "max_players": 20,
-  "motd": "Garuda Minecraft Server",
-  "version": "1.20.0",
-  "world_name": "garuda-world",
-  "seed": 12345,
-  "debug": true,
-  "raknet_timeout": 30,
-  "mtu_size": 1492,
-  "gamemode": "survival",
-  "difficulty": 2,
-  "spawn_protection": 16,
-  "view_distance": 8,
-  "allow_cheats": false,
-  "pvp": true,
-  "allow_flight": false,
-  "spawn_monsters": true,
-  "spawn_animals": true,
-  "online_mode": false,
-  "resource_packs": [],
-  "whitelist": false,
-  "max_world_size": 10000
+  "server": {
+    "address": "0.0.0.0:19132",
+    "max_players": 20,
+    "motd": "§bGaruda§f Minecraft Server",
+    "version": "1.19.50"
+  },
+  "world": {
+    "name": "world",
+    "seed": "garuda",
+    "gamemode": "survival",
+    "difficulty": 2,
+    "view_distance": 8
+  },
+  "debug": true
 }

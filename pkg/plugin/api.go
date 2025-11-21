@@ -1,86 +1,187 @@
 package plugin
 
 import (
-    "github.com/anabex-dev/garuda/internal/protocol/minecraft"
-    "github.com/anabex-dev/garuda/internal/world"
+    "garuda/minecraft"
+    "garuda/world"
 )
 
-// GarudaAPI provides methods untuk plugins berinteraksi dengan server
-type GarudaAPI struct {
-    manager *PluginManager
+type PluginAPI struct {
+    manager PluginManager
 }
 
-func NewGarudaAPI(manager *PluginManager) *GarudaAPI {
-    return &GarudaAPI{
+func NewPluginAPI(manager PluginManager) *PluginAPI {
+    return &PluginAPI{
         manager: manager,
     }
 }
 
-// Player management
-func (api *GarudaAPI) BroadcastMessage(message string) {
-    api.manager.server.BroadcastMessage(message)
+func (api *PluginAPI) GetServer() Server {
+    return api.manager.GetServer()
 }
 
-func (api *GarudaAPI) GetPlayer(name string) *world.Player {
-    return api.manager.server.GetPlayer(name)
+func (api *PluginAPI) BroadcastMessage(message string) {
+    api.manager.BroadcastMessage(message)
 }
 
-func (api *GarudaAPI) GetOnlinePlayers() []*world.Player {
-    return api.manager.server.GetOnlinePlayers()
+func (api *PluginAPI) GetPlayer(name string) world.Player {
+    return api.manager.GetPlayer(name)
 }
 
-func (api *GarudaAPI) SendMessageToPlayer(player *world.Player, message string) {
-    // TODO: Implement player message sending
+func (api *PluginAPI) GetOnlinePlayers() []world.Player {
+    return api.manager.GetOnlinePlayers()
 }
 
-func (api *GarudaAPI) KickPlayer(player *world.Player, reason string) {
-    // TODO: Implement player kicking
+func (api *PluginAPI) RegisterEvent(eventType EventType, handler EventHandler) {
+    api.manager.RegisterEvent(eventType, handler)
 }
 
-// World management
-func (api *GarudaAPI) GetWorld() *world.World {
-    return api.manager.server.GetWorld()
+func (api *PluginAPI) RegisterCommand(command string, handler CommandHandler) {
+    api.manager.RegisterCommand(command, handler)
 }
 
-func (api *GarudaAPI) SetBlock(pos minecraft.BlockPos, block world.Block) {
-    world := api.GetWorld()
-    chunkX := pos.X >> 4
-    chunkZ := pos.Z >> 4
-    localX := pos.X & 0xF
-    localZ := pos.Z & 0xF
+func (api *PluginAPI) CreateItemStack(id uint32, count byte, data uint16) minecraft.ItemStack {
+    return minecraft.ItemStack{
+        ID:    id,
+        Count: count,
+        Data:  data,
+    }
+}
+
+func (api *PluginAPI) CreateBlockPosition(x, y, z int) [3]int {
+    return [3]int{x, y, z}
+}
+
+func (api *PluginAPI) CreateVector3(x, y, z float32) [3]float32 {
+    return [3]float32{x, y, z}
+}
+
+type PermissionManager interface {
+    AddPermission(player world.Player, permission string)
+    RemovePermission(player world.Player, permission string)
+    HasPermission(player world.Player, permission string) bool
+}
+
+type SimplePermissionManager struct {
+    permissions map[string]map[string]bool
+}
+
+func NewSimplePermissionManager() *SimplePermissionManager {
+    return &SimplePermissionManager{
+        permissions: make(map[string]map[string]bool),
+    }
+}
+
+func (pm *SimplePermissionManager) AddPermission(player world.Player, permission string) {
+    playerName := player.Username
+    if pm.permissions[playerName] == nil {
+        pm.permissions[playerName] = make(map[string]bool)
+    }
+    pm.permissions[playerName][permission] = true
+}
+
+func (pm *SimplePermissionManager) RemovePermission(player world.Player, permission string) {
+    playerName := player.Username
+    if pm.permissions[playerName] != nil {
+        delete(pm.permissions[playerName], permission)
+    }
+}
+
+func (pm *SimplePermissionManager) HasPermission(player world.Player, permission string) bool {
+    playerName := player.Username
+    if pm.permissions[playerName] == nil {
+        return false
+    }
+    return pm.permissions[playerName][permission]
+}
+
+type Scheduler interface {
+    RunTask(plugin Plugin, task func())
+    RunTaskLater(plugin Plugin, task func(), delayTicks int)
+    RunTaskTimer(plugin Plugin, task func(), delayTicks int, periodTicks int)
+    CancelTasks(plugin Plugin)
+}
+
+type SimpleScheduler struct {
+    tasks map[string][]*ScheduledTask
+}
+
+type ScheduledTask struct {
+    TaskID      int
+    Plugin      Plugin
+    Task        func()
+    DelayTicks  int
+    PeriodTicks int
+    CurrentTick int
+    Cancelled   bool
+}
+
+func NewSimpleScheduler() *SimpleScheduler {
+    return &SimpleScheduler{
+        tasks: make(map[string][]*ScheduledTask),
+    }
+}
+
+func (s *SimpleScheduler) RunTask(plugin Plugin, task func()) {
+    s.runTaskInternal(plugin, task, 0, 0)
+}
+
+func (s *SimpleScheduler) RunTaskLater(plugin Plugin, task func(), delayTicks int) {
+    s.runTaskInternal(plugin, task, delayTicks, 0)
+}
+
+func (s *SimpleScheduler) RunTaskTimer(plugin Plugin, task func(), delayTicks int, periodTicks int) {
+    s.runTaskInternal(plugin, task, delayTicks, periodTicks)
+}
+
+func (s *SimpleScheduler) runTaskInternal(plugin Plugin, task func(), delayTicks int, periodTicks int) {
+    pluginName := plugin.GetName()
+    taskID := len(s.tasks[pluginName]) + 1
     
-    chunk := world.GetChunk(chunkX, chunkZ)
-    chunk.SetBlock(localX, pos.Y, localZ, block)
+    scheduledTask := &ScheduledTask{
+        TaskID:      taskID,
+        Plugin:      plugin,
+        Task:        task,
+        DelayTicks:  delayTicks,
+        PeriodTicks: periodTicks,
+        CurrentTick: 0,
+        Cancelled:   false,
+    }
     
-    // TODO: Broadcast block update
+    s.tasks[pluginName] = append(s.tasks[pluginName], scheduledTask)
 }
 
-func (api *GarudaAPI) GetBlock(pos minecraft.BlockPos) world.Block {
-    world := api.GetWorld()
-    chunkX := pos.X >> 4
-    chunkZ := pos.Z >> 4
-    localX := pos.X & 0xF
-    localZ := pos.Z & 0xF
-    
-    chunk := world.GetChunk(chunkX, chunkZ)
-    return chunk.GetBlock(localX, pos.Y, localZ)
+func (s *SimpleScheduler) CancelTasks(plugin Plugin) {
+    pluginName := plugin.GetName()
+    delete(s.tasks, pluginName)
 }
 
-// Command execution
-func (api *GarudaAPI) ExecuteCommand(command string) bool {
-    return api.manager.server.ExecuteCommand(command)
-}
-
-// Plugin management
-func (api *GarudaAPI) GetPlugin(name string) Plugin {
-    return api.manager.GetPlugin(name)
-}
-
-func (api *GarudaAPI) IsPluginEnabled(name string) bool {
-    return api.manager.IsEnabled(name)
-}
-
-// Utility methods
-func (api *GarudaAPI) Logger() *log.Logger {
-    return log.Default()
+func (s *SimpleScheduler) Tick() {
+    for pluginName, tasks := range s.tasks {
+        var remainingTasks []*ScheduledTask
+        
+        for _, task := range tasks {
+            if task.Cancelled {
+                continue
+            }
+            
+            task.CurrentTick++
+            
+            if task.CurrentTick >= task.DelayTicks {
+                if task.PeriodTicks > 0 {
+                    if (task.CurrentTick-task.DelayTicks)%task.PeriodTicks == 0 {
+                        task.Task()
+                    }
+                } else {
+                    task.Task()
+                    task.Cancelled = true
+                }
+            }
+            
+            if !task.Cancelled {
+                remainingTasks = append(remainingTasks, task)
+            }
+        }
+        
+        s.tasks[pluginName] = remainingTasks
+    }
 }

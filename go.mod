@@ -1,4 +1,4 @@
-module github.com/anabex-dev/garuda
+module garuda
 
 go 1.21
 

@@ -1,133 +1,207 @@
 package raknet
 
-// Tambah field di RakNetServer
-type RakNetServer struct {
-    conn         *net.UDPConn
-    sessions     map[string]*Session
-    sessionsMutex sync.RWMutex
-    running      bool
-    address      string
-    port         int
-    
-    // Timer untuk reliable manager tasks
-    ackTicker    *time.Ticker
-    timeoutTicker *time.Ticker
+import (
+    "fmt"
+    "garuda/pkg/utils"
+    "net"
+    "sync"
+    "time"
+)
+
+type Server struct {
+    address     string
+    listener    *net.UDPConn
+    logger      *utils.Logger
+    sessions    map[string]*Session
+    sessionMutex sync.RWMutex
+    running     bool
+    serverGUID  int64
 }
 
-// Update handlePacket function
-func (s *RakNetServer) handlePacket(addr *net.UDPAddr, data []byte) {
-    if len(data) < 1 {
-        return
-    }
-
-    packetID := data[0]
-    
-    session := s.getOrCreateSession(addr)
-    session.UpdateActivity()
-
-    switch {
-    case packetID >= 0x80 && packetID <= 0x8d: // ACK ranges
-        session.reliableManager.HandleAck(data)
-    case packetID >= 0x8e && packetID <= 0x9d: // NACK ranges
-        session.reliableManager.HandleAck(data)
-    case packetID == 0x00: // Connected ping with timestamp
-        // Handle game packets
-        packets := session.reliableManager.ProcessReceivedDatagram(data)
-        for _, packet := range packets {
-            session.HandleGamePacket(packet.Data)
-        }
-    default:
-        // Handle other packet types as before
-        switch packetID {
-        case 0x01: // Unconnected Ping
-            s.handleUnconnectedPing(addr, data)
-        case 0x05: // Open Connection Request 1
-            s.handleOpenConnectionRequest1(addr, data)
-        case 0x07: // Open Connection Request 2
-            s.handleOpenConnectionRequest2(addr, data)
-        case 0x08: // Connection Request
-            s.handleConnectionRequest(session, data)
-        case 0x09: // New Incoming Connection
-            s.handleNewIncomingConnection(session, data)
-        case 0x13: // Disconnect Notification
-            s.handleDisconnect(session)
-        case 0x15: // Connected Ping
-            s.handleConnectedPing(session, data)
-        case 0x1c: // Connected Pong
-            // Just update activity
-        default:
-            log.Printf("Unknown packet ID: 0x%02x from %s", packetID, addr)
-        }
+func NewServer(address string, logger *utils.Logger) *Server {
+    return &Server{
+        address:    address,
+        logger:     logger,
+        sessions:   make(map[string]*Session),
+        serverGUID: generateGUID(),
+        running:    false,
     }
 }
 
-// Update Start function untuk start timers
-func (s *RakNetServer) Start() error {
-    addr, err := net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", s.address, s.port))
+func generateGUID() int64 {
+    return time.Now().UnixNano()
+}
+
+func (s *Server) Start() error {
+    udpAddr, err := net.ResolveUDPAddr("udp", s.address)
     if err != nil {
-        return err
+        return fmt.Errorf("failed to resolve address: %v", err)
     }
 
-    conn, err := net.ListenUDP("udp", addr)
+    s.listener, err = net.ListenUDP("udp", udpAddr)
     if err != nil {
-        return err
+        return fmt.Errorf("failed to listen: %v", err)
     }
 
-    s.conn = conn
     s.running = true
+    s.logger.Info("RakNet server started on %s", s.address)
+    s.logger.Info("Server GUID: %d", s.serverGUID)
 
-    // Start timers for reliable messaging
-    s.ackTicker = time.NewTicker(100 * time.Millisecond)
-    s.timeoutTicker = time.NewTicker(1 * time.Second)
-
-    log.Printf("RakNet server listening on %s:%d", s.address, s.port)
-    
-    go s.readLoop()
-    go s.cleanupLoop()
-    go s.reliableManagerLoop()
+    go s.handlePackets()
 
     return nil
 }
 
-func (s *RakNetServer) reliableManagerLoop() {
+func (s *Server) handlePackets() {
+    buffer := make([]byte, 1500) // Standard MTU
+
     for s.running {
-        select {
-        case <-s.ackTicker.C:
-            s.sendAllAcks()
-        case <-s.timeoutTicker.C:
-            s.checkAllTimeouts()
+        n, addr, err := s.listener.ReadFromUDP(buffer)
+        if err != nil {
+            if s.running {
+                s.logger.Error("Error reading from UDP: %v", err)
+            }
+            continue
+        }
+
+        data := make([]byte, n)
+        copy(data, buffer[:n])
+
+        go s.handlePacket(data, addr)
+    }
+}
+
+func (s *Server) handlePacket(data []byte, addr *net.UDPAddr) {
+    packet, err := ReadPacket(data)
+    if err != nil {
+        s.logger.Debug("Failed to read packet from %s: %v", addr.String(), err)
+        return
+    }
+
+    clientAddr := addr.String()
+
+    switch packet.ID {
+    case ID_UNCONNECTED_PING:
+        s.handleUnconnectedPing(packet.Data, addr)
+    case ID_OPEN_CONNECTION_REQUEST_1:
+        s.handleOpenConnectionRequest1(packet.Data, addr)
+    case ID_OPEN_CONNECTION_REQUEST_2:
+        s.handleOpenConnectionRequest2(packet.Data, addr)
+    case ID_CONNECTION_REQUEST:
+        s.handleConnectionRequest(packet.Data, clientAddr)
+    default:
+        // Handle connected packets through session
+        s.sessionMutex.RLock()
+        session, exists := s.sessions[clientAddr]
+        s.sessionMutex.RUnlock()
+
+        if exists {
+            session.handlePacket(packet)
+        } else {
+            s.logger.Debug("Unknown packet ID 0x%02x from %s", packet.ID, clientAddr)
         }
     }
 }
 
-func (s *RakNetServer) sendAllAcks() {
-    s.sessionsMutex.RLock()
-    defer s.sessionsMutex.RUnlock()
+func (s *Server) handleUnconnectedPing(data []byte, addr *net.UDPAddr) {
+    ping, err := DecodeUnconnectedPing(data)
+    if err != nil {
+        s.logger.Debug("Failed to decode unconnected ping: %v", err)
+        return
+    }
+
+    if !VerifyMagic(ping.Magic) {
+        s.logger.Debug("Invalid magic from %s", addr.String())
+        return
+    }
+
+    // USE PROTOCOL MANAGER FOR MOTD
+    motd := s.protocolManager.GetMOTD(s.config.Server.MOTD, len(s.players), s.config.Server.MaxPlayers)
+    pong := &UnconnectedPong{
+        PingID:    ping.PingID,
+        ServerGUID: s.serverGUID,
+        Magic:     Magic,
+        MOTD:      motd,
+    }
+
+    response := EncodeUnconnectedPong(pong)
+    s.sendResponse(response, addr)
+    s.logger.Debug("Sent pong to %s", addr.String())
+}
+
+func (s *Server) handleOpenConnectionRequest1(data []byte, addr *net.UDPAddr) {
+    request, err := DecodeOpenConnectionRequest1(data)
+    if err != nil {
+        s.logger.Debug("Failed to decode open connection request 1: %v", err)
+        return
+    }
+
+    if !VerifyMagic(request.Magic) {
+        s.logger.Debug("Invalid magic in OpenConnectionRequest1 from %s", addr.String())
+        return
+    }
+
+    // Check protocol version
+    if request.Protocol != 10 { // Bedrock protocol version
+        s.logger.Debug("Incompatible protocol version %d from %s", request.Protocol, addr.String())
+        // Send incompatible protocol packet
+        return
+    }
+
+    reply := &OpenConnectionReply1{
+        Magic:      Magic,
+        ServerGUID: s.serverGUID,
+        UseSecurity: false,
+        MTUSize:    int16(request.MTUSize),
+    }
+
+    response := EncodeOpenConnectionReply1(reply)
+    s.sendResponse(response, addr)
+    s.logger.Debug("Sent OpenConnectionReply1 to %s", addr.String())
+}
+
+func (s *Server) handleOpenConnectionRequest2(data []byte, addr *net.UDPAddr) {
+    // For now, just accept the connection
+    session := NewSession(addr, s, s.logger)
     
-    for _, session := range s.sessions {
-        session.reliableManager.SendAcks()
+    s.sessionMutex.Lock()
+    s.sessions[addr.String()] = session
+    s.sessionMutex.Unlock()
+
+    session.handleOpenConnectionRequest2(data)
+    s.logger.Info("New connection from %s", addr.String())
+}
+
+func (s *Server) handleConnectionRequest(data []byte, clientAddr string) {
+    s.sessionMutex.RLock()
+    session, exists := s.sessions[clientAddr]
+    s.sessionMutex.RUnlock()
+
+    if exists {
+        session.handleConnectionRequest(data)
     }
 }
 
-func (s *RakNetServer) checkAllTimeouts() {
-    s.sessionsMutex.RLock()
-    defer s.sessionsMutex.RUnlock()
-    
-    for _, session := range s.sessions {
-        session.reliableManager.CheckTimeouts()
+func (s *Server) sendResponse(data []byte, addr *net.UDPAddr) {
+    _, err := s.listener.WriteToUDP(data, addr)
+    if err != nil {
+        s.logger.Error("Failed to send response to %s: %v", addr.String(), err)
     }
 }
 
-// Update Stop function
-func (s *RakNetServer) Stop() {
+func (s *Server) Close() {
     s.running = false
-    if s.ackTicker != nil {
-        s.ackTicker.Stop()
+    if s.listener != nil {
+        s.listener.Close()
     }
-    if s.timeoutTicker != nil {
-        s.timeoutTicker.Stop()
+    
+    // Close all sessions
+    s.sessionMutex.Lock()
+    for _, session := range s.sessions {
+        session.Close()
     }
-    if s.conn != nil {
-        s.conn.Close()
-    }
+    s.sessions = make(map[string]*Session)
+    s.sessionMutex.Unlock()
+    
+    s.logger.Info("RakNet server stopped")
 }

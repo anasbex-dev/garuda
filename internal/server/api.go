@@ -1,1074 +1,755 @@
 package server
 
 import (
-    "fmt"
-    "log"
-    "sort"
-    "strings"
+    "garuda/internal/config"
+    "garuda/internal/network/raknet"
+    "garuda/minecraft"
+    "garuda/pkg/plugin"
+    "garuda/pkg/utils"
+    "garuda/world"
+    "math"
     "sync"
     "time"
-
-    "garuda/internal/protocol/minecraft"
-    "garuda/internal/world"
-    "garuda/pkg/plugin"
 )
 
-// GarudaServer implements the main server API for plugins and systems
-type GarudaServer struct {
-    world        *world.World
-    players      map[string]*world.Player
-    playersMutex sync.RWMutex
-    commands     map[string]CommandHandler
-    commandsMutex sync.RWMutex
-    broadcastChan chan BroadcastMessage
-    running      bool
-    startTime    time.Time
-    statistics   *ServerStatistics
-    banManager   *BanManager
-    whitelist    *WhitelistManager
-    ops          *OpsManager
-    playerBalances map[string]int
-    economyMutex   sync.RWMutex
+type Player struct {
+    Username    string
+    UUID        string
+    EntityID    int64
+    RuntimeID   uint64
+    Session     *raknet.Session
+    Position    [3]float32
+    Rotation    [2]float32
+    World       *world.World
+    Gamemode    int32
+    Health      float32
+    IsSpawned   bool
+    WorldPlayer *world.Player
 }
 
-// ServerStatistics holds server performance statistics
-type ServerStatistics struct {
-    Uptime              time.Duration
-    TicksProcessed      uint64
-    PlayersJoined       uint64
-    PlayersLeft         uint64
-    ChunksLoaded        uint64
-    EntitiesSpawned     uint64
-    PacketsProcessed    uint64
-    MemoryAllocated     uint64
-    mutex               sync.RWMutex
+type Server struct {
+    raknetServer    *raknet.Server
+    config          *config.Config
+    logger          *utils.Logger
+    players         map[string]*Player
+    playerMutex     sync.RWMutex
+    world           *world.World
+    entityManager   *world.EntityManager
+    pluginManager   *plugin.PluginManagerImpl
+    combatManager   *world.CombatManager
+    inventoryManager *world.InventoryManager
+    protocolManager *protocol.ProtocolManager
+    running         bool
+    ticker          *time.Ticker
+    tickCount       int64
 }
 
-// BroadcastMessage represents a message to broadcast
-type BroadcastMessage struct {
-    Message   string
-    Type      MessageType
-    Target    BroadcastTarget
-    Exclude   *world.Player
+// Server implementation for plugin interface
+type ServerForPlugins struct {
+    server *Server
 }
 
-// MessageType defines the type of broadcast message
-type MessageType int
-
-const (
-    MessageTypeChat MessageType = iota
-    MessageTypeSystem
-    MessageTypePopup
-    MessageTypeTip
-    MessageTypeAnnouncement
-    MessageTypeJson
-)
-
-// BroadcastTarget defines who should receive the broadcast
-type BroadcastTarget int
-
-const (
-    TargetAllPlayers BroadcastTarget = iota
-    TargetOpsOnly
-    TargetSpecificPlayers
-    TargetWorld
-)
-
-// CommandHandler defines the interface for command handlers
-type CommandHandler func(sender CommandSender, args []string) bool
-
-// CommandSender defines who can execute commands
-type CommandSender interface {
-    GetName() string
-    HasPermission(permission string) bool
-    SendMessage(message string)
-    IsPlayer() bool
-    GetPlayer() *world.Player
+func (s *ServerForPlugins) GetName() string {
+    return "Garuda"
 }
 
-// PlayerCommandSender implements CommandSender for players
-type PlayerCommandSender struct {
-    player *world.Player
+func (s *ServerForPlugins) GetVersion() string {
+    return s.server.config.Server.Version
 }
 
-// ConsoleCommandSender implements CommandSender for console
-type ConsoleCommandSender struct {
-    name string
+func (s *ServerForPlugins) GetMaxPlayers() int {
+    return s.server.config.Server.MaxPlayers
 }
 
-// BanManager manages player bans
-type BanManager struct {
-    bannedPlayers map[string]BanEntry
-    bannedIPs     map[string]BanEntry
-    mutex         sync.RWMutex
+func (s *ServerForPlugins) GetPlayerCount() int {
+    s.server.playerMutex.RLock()
+    defer s.server.playerMutex.RUnlock()
+    return len(s.server.players)
 }
 
-// BanEntry represents a ban record
-type BanEntry struct {
-    Name       string
-    IP         string
-    Reason     string
-    Source     string
-    Created    time.Time
-    Expires    *time.Time
-    Permanent  bool
+func (s *ServerForPlugins) BroadcastPacket(packetData []byte) {
+    s.server.BroadcastPacket(packetData)
 }
 
-// WhitelistManager manages the whitelist
-type WhitelistManager struct {
-    enabled    bool
-    players    map[string]WhitelistEntry
-    mutex      sync.RWMutex
+func (s *ServerForPlugins) ExecuteCommand(command string) bool {
+    consoleSender := &plugin.ConsoleCommandSender{}
+    return s.server.pluginManager.ExecuteCommand(consoleSender, command)
 }
 
-// WhitelistEntry represents a whitelist entry
-type WhitelistEntry struct {
-    Name    string
-    AddedBy string
-    AddedAt time.Time
-}
-
-// OpsManager manages server operators
-type OpsManager struct {
-    ops   map[string]OpEntry
-    mutex sync.RWMutex
-}
-
-// OpEntry represents an operator entry
-type OpEntry struct {
-    Name      string
-    Level     int
-    BypassesPlayerLimit bool
-}
-
-// NewGarudaServer creates a new Garuda server instance
-func NewGarudaServer(world *world.World) *GarudaServer {
-    server := &GarudaServer{
-        world:        world,
-        players:      make(map[string]*world.Player),
-        commands:     make(map[string]CommandHandler),
-        broadcastChan: make(chan BroadcastMessage, 100),
-        running:      true,
-        startTime:    time.Now(),
-        statistics:   &ServerStatistics{},
-        banManager:   NewBanManager(),
-        whitelist:    NewWhitelistManager(),
-        ops:          NewOpsManager(),
-        playerBalances: make(map[string]int),
+func NewServer(raknetServer *raknet.Server, cfg *config.Config, logger *utils.Logger) *Server {
+    worldInstance := world.NewWorld(cfg.World.Name, cfg.World.Seed, logger)
+    entityManager := world.NewEntityManager(logger)
+    combatManager := world.NewCombatManager(logger)
+    inventoryManager := world.NewInventoryManager(logger)
+    
+    server := &Server{
+        raknetServer:    raknetServer,
+        config:          cfg,
+        logger:          logger,
+        players:         make(map[string]*Player),
+        world:           worldInstance,
+        entityManager:   entityManager,
+        combatManager:   combatManager,
+        inventoryManager: inventoryManager,
+        protocolManager: protocolManager,
+        running:         false,
+        tickCount:       0,
     }
-
-    // Register built-in commands
-    server.registerBuiltinCommands()
-
-    // Start background workers
-    go server.broadcastLoop()
-    go server.statisticsLoop()
-    go server.autoSaveLoop()
-
-    log.Printf("Garuda server API initialized")
+    
+    // Initialize plugin manager with server reference
+    if !protocolManager.SetServerVersion(cfg.Protocol.Version) {
+        logger.Warn("Failed to set server version to %s, using latest", cfg.Protocol.Version)
+    }
+    
+    serverPlugin := &ServerForPlugins{server: server}
+    server.pluginManager = plugin.NewPluginManager(serverPlugin, logger)
+    
     return server
 }
 
-// BroadcastMessage broadcasts a message to players
-func (s *GarudaServer) BroadcastMessage(message string) {
-    msg := BroadcastMessage{
-        Message: message,
-        Type:    MessageTypeSystem,
-        Target:  TargetAllPlayers,
+func (s *Server) Start() error {
+    s.running = true
+    s.ticker = time.NewTicker(50 * time.Millisecond)
+    go s.tickLoop()
+    
+    s.logger.Info("Garuda Minecraft Server starting...")
+    s.logger.Info("Version: %s", s.config.Server.Version)
+    s.logger.Info("Max Players: %d", s.config.Server.MaxPlayers)
+    s.logger.Info("MOTD: %s", s.config.Server.MOTD)
+    s.logger.Info("World: %s (Seed: %s)", s.config.World.Name, s.config.World.Seed)
+    
+    s.protocolManager.LogSupportedVersions
+    
+    s.loadPlugins()
+    s.spawnInitialMobs()
+    
+    if err := s.raknetServer.Start(); err != nil {
+        return err
     }
-    s.broadcastChan <- msg
+    
+    s.logger.Info("Minecraft server is ready!")
+    
+    select {}
 }
 
-// BroadcastMessageToOps broadcasts a message to operators only
-func (s *GarudaServer) BroadcastMessageToOps(message string) {
-    msg := BroadcastMessage{
-        Message: message,
-        Type:    MessageTypeSystem,
-        Target:  TargetOpsOnly,
-    }
-    s.broadcastChan <- msg
+func (s *Server) loadPlugins() {
+    s.logger.Info("Loading plugins...")
+    
+    // In real implementation, this would scan plugins directory
+    // For now, we'll manually load essentials
+    // essentials := &essentials.EssentialsPlugin{}
+    // if s.pluginManager.LoadPlugin(essentials) {
+    //     s.logger.Info("Loaded Essentials plugin")
+    // }
+    
+    s.logger.Info("Plugin system ready (%d plugins loaded)", len(s.pluginManager.GetPlugins()))
 }
 
-// GetPlayer returns a player by name
-func (s *GarudaServer) GetPlayer(name string) *world.Player {
-    s.playersMutex.RLock()
-    defer s.playersMutex.RUnlock()
-
-    // Case-insensitive search
-    lowerName := strings.ToLower(name)
-    for username, player := range s.players {
-        if strings.ToLower(username) == lowerName {
-            return player
+func (s *Server) spawnInitialMobs() {
+    positions := [][3]float32{
+        {10, 60, 10},
+        {-10, 60, -10},
+        {15, 60, -5},
+        {-5, 60, 15},
+    }
+    
+    for i, pos := range positions {
+        mobType := world.EntityZombie
+        if i%2 == 0 {
+            mobType = world.EntitySkeleton
         }
+        s.entityManager.SpawnMob(mobType, s.world, pos)
     }
-    return nil
+    
+    s.logger.Info("Spawned initial mobs")
 }
 
-// GetOnlinePlayers returns all online players
-func (s *GarudaServer) GetOnlinePlayers() []*world.Player {
-    s.playersMutex.RLock()
-    defer s.playersMutex.RUnlock()
+func (s *Server) tickLoop() {
+    for range s.ticker.C {
+        if !s.running {
+            return
+        }
+        s.tick()
+    }
+}
 
-    players := make([]*world.Player, 0, len(s.players))
+func (s *Server) tick() {
+    s.tickCount++
+    
+    s.pluginManager.Tick()
+    s.entityManager.UpdateEntities()
+    
+    // Clean up old combat events setiap 10 detik
+    if s.tickCount%200 == 0 {
+        s.combatManager.ClearOldEvents(10 * time.Second)
+    }
+    
+    s.playerMutex.RLock()
+    defer s.playerMutex.RUnlock()
+    
     for _, player := range s.players {
-        players = append(players, player)
+        s.updatePlayer(player)
     }
     
-    // Sort by username for consistent ordering
-    sort.Slice(players, func(i, j int) bool {
-        return players[i].Username < players[j].Username
-    })
-    
-    return players
-}
-
-// GetPlayerCount returns the number of online players
-func (s *GarudaServer) GetPlayerCount() int {
-    s.playersMutex.RLock()
-    defer s.playersMutex.RUnlock()
-    return len(s.players)
-}
-
-// AddPlayer adds a player to the server
-func (s *GarudaServer) AddPlayer(player *world.Player) {
-    s.playersMutex.Lock()
-    defer s.playersMutex.Unlock()
-
-    s.players[player.Username] = player
-    
-    // Update statistics
-    s.statistics.mutex.Lock()
-    s.statistics.PlayersJoined++
-    s.statistics.mutex.Unlock()
-
-    log.Printf("Player %s added to server (Total: %d)", player.Username, len(s.players))
-}
-
-// RemovePlayer removes a player from the server
-func (s *GarudaServer) RemovePlayer(player *world.Player) {
-    s.playersMutex.Lock()
-    defer s.playersMutex.Unlock()
-
-    delete(s.players, player.Username)
-    
-    // Update statistics
-    s.statistics.mutex.Lock()
-    s.statistics.PlayersLeft++
-    s.statistics.mutex.Unlock()
-
-    log.Printf("Player %s removed from server (Remaining: %d)", player.Username, len(s.players))
-}
-
-// ExecuteCommand executes a server command
-func (s *GarudaServer) ExecuteCommand(command string) bool {
-    parts := strings.Split(command, " ")
-    if len(parts) == 0 {
-        return false
-    }
-
-    cmd := strings.ToLower(parts[0])
-    args := parts[1:]
-
-    s.commandsMutex.RLock()
-    handler, exists := s.commands[cmd]
-    s.commandsMutex.RUnlock()
-
-    if !exists {
-        log.Printf("Unknown command: %s", cmd)
-        return false
-    }
-
-    // Execute as console
-    sender := &ConsoleCommandSender{name: "CONSOLE"}
-    return handler(sender, args)
-}
-
-// ExecuteCommandAs executes a command as a specific sender
-func (s *GarudaServer) ExecuteCommandAs(sender CommandSender, command string) bool {
-    parts := strings.Split(command, " ")
-    if len(parts) == 0 {
-        return false
-    }
-
-    cmd := strings.ToLower(parts[0])
-    args := parts[1:]
-
-    s.commandsMutex.RLock()
-    handler, exists := s.commands[cmd]
-    s.commandsMutex.RUnlock()
-
-    if !exists {
-        sender.SendMessage(fmt.Sprintf("§cUnknown command: %s", cmd))
-        return false
-    }
-
-    return handler(sender, args)
-}
-
-// RegisterCommand registers a new command
-func (s *GarudaServer) RegisterCommand(command string, handler CommandHandler) {
-    s.commandsMutex.Lock()
-    defer s.commandsMutex.Unlock()
-
-    s.commands[strings.ToLower(command)] = handler
-    log.Printf("Command registered: /%s", command)
-}
-
-// UnregisterCommand removes a command
-func (s *GarudaServer) UnregisterCommand(command string) {
-    s.commandsMutex.Lock()
-    defer s.commandsMutex.Unlock()
-
-    delete(s.commands, strings.ToLower(command))
-    log.Printf("Command unregistered: /%s", command)
-}
-
-// GetWorld returns the server world
-func (s *GarudaServer) GetWorld() *world.World {
-    return s.world
-}
-
-// GetServerStats returns server statistics
-func (s *GarudaServer) GetServerStats() map[string]interface{} {
-    s.statistics.mutex.RLock()
-    defer s.statistics.mutex.RUnlock()
-
-    var m runtime.MemStats
-    runtime.ReadMemStats(&m)
-
-    return map[string]interface{}{
-        "uptime":           s.statistics.Uptime.String(),
-        "players_online":   len(s.players),
-        "players_joined":   s.statistics.PlayersJoined,
-        "players_left":     s.statistics.PlayersLeft,
-        "ticks_processed":  s.statistics.TicksProcessed,
-        "chunks_loaded":    s.statistics.ChunksLoaded,
-        "entities_spawned": s.statistics.EntitiesSpawned,
-        "packets_processed": s.statistics.PacketsProcessed,
-        "memory_allocated": m.Alloc,
-        "memory_system":    m.Sys,
-        "start_time":       s.startTime.Format(time.RFC3339),
+    if s.tickCount%20 == 0 {
+        s.sendTimeUpdates()
+        s.updateEntities()
     }
 }
 
-// KickPlayer kicks a player from the server
-func (s *GarudaServer) KickPlayer(player *world.Player, reason string) {
-    // TODO: Implement player kicking logic
-    log.Printf("Kicking player %s: %s", player.Username, reason)
+func (s *Server) updateEntities() {
+    entities := s.entityManager.GetEntitiesInRange([3]float32{0, 60, 0}, 50.0)
     
-    // Send disconnect packet
-    // disconnectPacket := &minecraft.DisconnectPacket{
-    //     HideDisconnectionScreen: false,
-    //     Message: reason,
-    // }
-    // player.SendPacket(disconnectPacket)
-    
-    // Remove player from server
-    s.RemovePlayer(player)
-}
-
-// BanPlayer bans a player from the server
-func (s *GarudaServer) BanPlayer(name, reason, source string) bool {
-    return s.banManager.BanPlayer(name, reason, source)
-}
-
-// PardonPlayer removes a player ban
-func (s *GarudaServer) PardonPlayer(name string) bool {
-    return s.banManager.PardonPlayer(name)
-}
-
-// IsPlayerBanned checks if a player is banned
-func (s *GarudaServer) IsPlayerBanned(name string) bool {
-    return s.banManager.IsPlayerBanned(name)
-}
-
-// AddToWhitelist adds a player to the whitelist
-func (s *GarudaServer) AddToWhitelist(name, addedBy string) bool {
-    return s.whitelist.AddPlayer(name, addedBy)
-}
-
-// RemoveFromWhitelist removes a player from the whitelist
-func (s *GarudaServer) RemoveFromWhitelist(name string) bool {
-    return s.whitelist.RemovePlayer(name)
-}
-
-// IsWhitelisted checks if a player is whitelisted
-func (s *GarudaServer) IsWhitelisted(name string) bool {
-    return s.whitelist.IsWhitelisted(name)
-}
-
-// SetWhitelistEnabled enables or disables the whitelist
-func (s *GarudaServer) SetWhitelistEnabled(enabled bool) {
-    s.whitelist.SetEnabled(enabled)
-}
-
-// AddOp adds a player as an operator
-func (s *GarudaServer) AddOp(name string, level int) bool {
-    return s.ops.AddOp(name, level)
-}
-
-// RemoveOp removes a player as an operator
-func (s *GarudaServer) RemoveOp(name string) bool {
-    return s.ops.RemoveOp(name)
-}
-
-// IsOp checks if a player is an operator
-func (s *GarudaServer) IsOp(name string) bool {
-    return s.ops.IsOp(name)
-}
-
-// GetOps returns all operators
-func (s *GarudaServer) GetOps() []string {
-    return s.ops.GetOps()
-}
-
-// SendMessageToPlayer sends a message to a specific player
-func (s *GarudaServer) SendMessageToPlayer(player *world.Player, message string) {
-    // TODO: Implement message sending to player
-    log.Printf("[MSG to %s] %s", player.Username, message)
-    
-    // textPacket := &minecraft.TextPacket{
-    //     TextType: minecraft.TextTypeSystem,
-    //     Message: message,
-    // }
-    // player.SendPacket(textPacket)
-}
-
-// TeleportPlayer teleports a player to a location
-func (s *GarudaServer) TeleportPlayer(player *world.Player, pos minecraft.Vector3) bool {
-    oldPos := player.Position
-    player.Position = pos
-    
-    log.Printf("Teleported player %s from %v to %v", 
-        player.Username, oldPos, pos)
-    
-    // TODO: Send move player packet to client
-    return true
-}
-
-// GiveItem gives an item to a player
-func (s *GarudaServer) GiveItem(player *world.Player, item *world.ItemStack) bool {
-    if player.Inventory.AddItem(item) {
-        log.Printf("Gave item %d x%d to %s", item.ID, item.Count, player.Username)
-        
-        // TODO: Send inventory update packet
-        return true
-    }
-    
-    // Inventory full, drop item in world
-    dropPos := minecraft.Vector3{
-        X: player.Position.X,
-        Y: player.Position.Y + 1.0,
-        Z: player.Position.Z,
-    }
-    
-    s.world.GetEntityManager().CreateItemEntity(dropPos, item)
-    log.Printf("Dropped item %d x%d for %s (inventory full)", item.ID, item.Count, player.Username)
-    
-    return true
-}
-
-// SetGameRule sets a game rule
-func (s *GarudaServer) SetGameRule(name string, value interface{}) bool {
-    return s.world.SetGameRule(name, value)
-}
-
-// GetGameRule gets a game rule value
-func (s *GarudaServer) GetGameRule(name string) interface{} {
-    rule, exists := s.world.GetGameRule(name)
-    if exists {
-        return rule.Value
-    }
-    return nil
-}
-
-// SetTime sets the world time
-func (s *GarudaServer) SetTime(time int32) {
-    // TODO: Implement world time setting
-    log.Printf("Setting world time to %d", time)
-}
-
-// SetWeather sets the world weather
-func (s *GarudaServer) SetWeather(weatherType int, duration int) {
-    // TODO: Implement weather setting
-    log.Printf("Setting weather to %d for %d ticks", weatherType, duration)
-}
-
-// SaveWorld saves the world
-func (s *GarudaServer) SaveWorld() bool {
-    log.Printf("Saving world...")
-    // TODO: Implement world saving
-    return true
-}
-
-// Stop stops the server
-func (s *GarudaServer) Stop() {
-    s.running = false
-    close(s.broadcastChan)
-    
-    log.Printf("Garuda server API stopped")
-}
-
-// ===== Background Workers =====
-
-func (s *GarudaServer) broadcastLoop() {
-    for msg := range s.broadcastChan {
-        s.handleBroadcast(msg)
-    }
-}
-
-func (s *GarudaServer) handleBroadcast(msg BroadcastMessage) {
-    players := s.GetOnlinePlayers()
-    
-    for _, player := range players {
-        // Check if player should be excluded
-        if msg.Exclude != nil && player.Username == msg.Exclude.Username {
+    for _, entity := range entities {
+        if !entity.IsAlive() {
+            s.entityManager.RemoveEntity(entity.ID)
+            removePacket := &minecraft.RemoveEntityPacket{EntityID: entity.ID}
+            if packetData, err := removePacket.Encode(); err == nil {
+                s.BroadcastPacket(packetData)
+            }
             continue
         }
         
-        // Check broadcast target
-        switch msg.Target {
-        case TargetAllPlayers:
-            // Send to all players
-            s.SendMessageToPlayer(player, msg.Message)
-        case TargetOpsOnly:
-            // Send only to ops
-            if s.IsOp(player.Username) {
-                s.SendMessageToPlayer(player, msg.Message)
+        s.broadcastEntityMovement(entity)
+    }
+}
+
+func (s *Server) broadcastEntityMovement(entity *world.Entity) {
+    if entity.Type == world.EntityPlayer {
+        return
+    }
+    
+    movePacket := &minecraft.MovePlayerPacket{
+        EntityID: entity.ID,
+        Position: entity.GetPosition(),
+        Pitch:    entity.GetRotation()[0],
+        Yaw:      entity.GetRotation()[1],
+        HeadYaw:  entity.GetRotation()[1],
+        Mode:     0,
+        OnGround: true,
+    }
+    
+    packetData, err := movePacket.Encode()
+    if err != nil {
+        s.logger.Error("Failed to encode entity move packet: %v", err)
+        return
+    }
+    
+    s.BroadcastPacket(packetData)
+}
+
+func (s *Server) updatePlayer(player *Player) {
+    if !player.IsSpawned {
+        return
+    }
+    
+    player.WorldPlayer.SetPosition(player.Position)
+    player.WorldPlayer.SetRotation(player.Rotation)
+    
+    s.sendMovementUpdates(player)
+    s.sendNearbyEntities(player)
+}
+
+func (s *Server) sendNearbyEntities(player *Player) {
+    if s.tickCount%100 != 0 {
+        return
+    }
+    
+    entities := s.entityManager.GetEntitiesInRange(player.Position, 50.0)
+    
+    for _, entity := range entities {
+        if entity.ID == player.EntityID {
+            continue
+        }
+        
+        s.sendEntityToPlayer(player, entity)
+    }
+}
+
+func (s *Server) sendEntityToPlayer(player *Player, entity *world.Entity) {
+    var packet minecraft.Packet
+    
+    switch entity.Type {
+    case world.EntityPlayer:
+        return
+    case world.EntityItem:
+        itemPacket := &minecraft.AddItemEntityPacket{
+            EntityID:  entity.ID,
+            RuntimeID: uint64(entity.ID),
+            Item:      minecraft.ItemStack{ID: 1, Count: 1, Data: 0},
+            Position:  entity.GetPosition(),
+            Velocity:  entity.GetVelocity(),
+        }
+        packet = itemPacket
+    default:
+        entityPacket := &minecraft.AddEntityPacket{
+            EntityID:   entity.ID,
+            RuntimeID:  uint64(entity.ID),
+            EntityType: s.getEntityTypeString(entity.Type),
+            Position:   entity.GetPosition(),
+            Velocity:   entity.GetVelocity(),
+            Pitch:      entity.GetRotation()[0],
+            Yaw:        entity.GetRotation()[1],
+        }
+        packet = entityPacket
+    }
+    
+    if packetData, err := packet.Encode(); err == nil {
+        player.Session.SendMinecraftPacket(packetData)
+    }
+}
+
+func (s *Server) getEntityTypeString(entityType int) string {
+    switch entityType {
+    case world.EntityZombie:
+        return "minecraft:zombie"
+    case world.EntitySkeleton:
+        return "minecraft:skeleton"
+    case world.EntityCreeper:
+        return "minecraft:creeper"
+    default:
+        return "minecraft:unknown"
+    }
+}
+
+func (s *Server) sendTimeUpdates() {
+    timeValue := int32(s.tickCount % 24000)
+    timePacket := &minecraft.SetTimePacket{Time: timeValue}
+    
+    packetData, err := timePacket.Encode()
+    if err != nil {
+        s.logger.Error("Failed to encode time packet: %v", err)
+        return
+    }
+    
+    s.BroadcastPacket(packetData)
+}
+
+func (s *Server) sendMovementUpdates(player *Player) {
+    movePacket := &minecraft.MovePlayerPacket{
+        EntityID: player.EntityID,
+        Position: player.Position,
+        Pitch:    player.Rotation[0],
+        Yaw:      player.Rotation[1],
+        HeadYaw:  player.Rotation[1],
+        Mode:     0,
+        OnGround: true,
+    }
+    
+    packetData, err := movePacket.Encode()
+    if err != nil {
+        s.logger.Error("Failed to encode move packet: %v", err)
+        return
+    }
+    
+    s.BroadcastToOthers(player, packetData)
+}
+
+// ===== COMBAT SYSTEM INTEGRATION =====
+
+func (s *Server) HandlePlayerAttack(session *raknet.Session, attackPacket *minecraft.PlayerActionPacket) {
+    s.playerMutex.RLock()
+    player, exists := s.players[session.GetAddress()]
+    s.playerMutex.RUnlock()
+    
+    if !exists {
+        return
+    }
+    
+    // Calculate target entity based on player's look direction
+    target := s.findTargetEntity(player)
+    if target == nil {
+        return
+    }
+    
+    // Get player's equipped item
+    weapon := player.WorldPlayer.GetSelectedItem()
+    
+    // Execute combat
+    event := s.combatManager.Attack(player.WorldPlayer.Entity, target, &weapon)
+    
+    if event != nil {
+        s.logger.Debug("Player %s attacked %s for %.1f damage", 
+            player.Username, s.combatManager.GetEntityName(target), event.Damage)
+        
+        // TODO: Send combat packets to clients
+        // Send damage indicator, sound effects, etc.
+    }
+}
+
+func (s *Server) findTargetEntity(player *Player) *world.Entity {
+    // Simple raycast untuk find target entity
+    playerPos := player.Position
+    playerRot := player.Rotation
+    
+    // Calculate look direction
+    yaw := playerRot[1] * (math.Pi / 180)
+    pitch := playerRot[0] * (math.Pi / 180)
+    
+    dirX := -float32(math.Sin(float64(yaw)) * math.Cos(float64(pitch)))
+    dirY := -float32(math.Sin(float64(pitch)))
+    dirZ := float32(math.Cos(float64(yaw)) * math.Cos(float64(pitch)))
+    
+    // Raycast for 5 blocks
+    for dist := float32(1.0); dist <= 5.0; dist += 0.5 {
+        checkPos := [3]float32{
+            playerPos[0] + dirX * dist,
+            playerPos[1] + dirY * dist,
+            playerPos[2] + dirZ * dist,
+        }
+        
+        // Check for entities at this position
+        entities := s.entityManager.GetEntitiesInRange(checkPos, 1.5)
+        for _, entity := range entities {
+            if entity != player.WorldPlayer.Entity {
+                return entity
             }
-        case TargetSpecificPlayers:
-            // Specific target handling would be implemented here
-        case TargetWorld:
-            // Send to players in specific world (future feature)
-            s.SendMessageToPlayer(player, msg.Message)
         }
     }
-}
-
-func (s *GarudaServer) statisticsLoop() {
-    ticker := time.NewTicker(30 * time.Second)
-    defer ticker.Stop()
     
-    for s.running {
-        <-ticker.C
-        
-        s.statistics.mutex.Lock()
-        s.statistics.Uptime = time.Since(s.startTime)
-        s.statistics.mutex.Unlock()
-        
-        // Log statistics periodically
-        stats := s.GetServerStats()
-        log.Printf("Server Stats - Uptime: %s, Players: %d, Memory: %.2fMB",
-            stats["uptime"], stats["players_online"], 
-            float64(stats["memory_allocated"].(uint64))/1024/1024)
-    }
-}
-
-func (s *GarudaServer) autoSaveLoop() {
-    ticker := time.NewTicker(5 * time.Minute)
-    defer ticker.Stop()
-    
-    for s.running {
-        <-ticker.C
-        s.SaveWorld()
-    }
-}
-
-// ===== Built-in Commands =====
-
-func (s *GarudaServer) registerBuiltinCommands() {
-    s.RegisterCommand("help", s.helpCommand)
-    s.RegisterCommand("list", s.listCommand)
-    s.RegisterCommand("tp", s.teleportCommand)
-    s.RegisterCommand("give", s.giveCommand)
-    s.RegisterCommand("time", s.timeCommand)
-    s.RegisterCommand("gamemode", s.gamemodeCommand)
-    s.RegisterCommand("kick", s.kickCommand)
-    s.RegisterCommand("ban", s.banCommand)
-    s.RegisterCommand("pardon", s.pardonCommand)
-    s.RegisterCommand("op", s.opCommand)
-    s.RegisterCommand("deop", s.deopCommand)
-    s.RegisterCommand("whitelist", s.whitelistCommand)
-    s.RegisterCommand("save", s.saveCommand)
-    s.RegisterCommand("stop", s.stopCommand)
-}
-
-func (s *GarudaServer) helpCommand(sender CommandSender, args []string) bool {
-    sender.SendMessage("§6=== Garuda Server Commands ===")
-    sender.SendMessage("§a/help §7- Show this help")
-    sender.SendMessage("§a/list §7- List online players")
-    sender.SendMessage("§a/tp <player> §7- Teleport to player")
-    sender.SendMessage("§a/give <player> <item> [count] §7- Give item to player")
-    sender.SendMessage("§a/gamemode <mode> [player] §7- Change gamemode")
-    sender.SendMessage("§a/time set <value> §7- Set world time")
-    sender.SendMessage("§a/kick <player> [reason] §7- Kick player")
-    sender.SendMessage("§a/ban <player> [reason] §7- Ban player")
-    sender.SendMessage("§a/op <player> §7- Make player operator")
-    sender.SendMessage("§a/whitelist <add|remove|list> §7- Manage whitelist")
-    sender.SendMessage("§a/save §7- Save the world")
-    sender.SendMessage("§a/stop §7- Stop the server")
-    return true
-}
-
-func (s *GarudaServer) listCommand(sender CommandSender, args []string) bool {
-    players := s.GetOnlinePlayers()
-    if len(players) == 0 {
-        sender.SendMessage("§7No players online")
-        return true
-    }
-    
-    playerNames := make([]string, len(players))
-    for i, player := range players {
-        playerNames[i] = player.Username
-    }
-    
-    sender.SendMessage(fmt.Sprintf("§7Online players (%d): §a%s", 
-        len(players), strings.Join(playerNames, ", ")))
-    return true
-}
-
-// Implement other command handlers...
-func (s *GarudaServer) teleportCommand(sender CommandSender, args []string) bool {
-    // Implementation for teleport command
-    return true
-}
-
-func (s *GarudaServer) giveCommand(sender CommandSender, args []string) bool {
-    // Implementation for give command
-    return true
-}
-
-func (s *GarudaServer) timeCommand(sender CommandSender, args []string) bool {
-    // Implementation for time command
-    return true
-}
-
-func (s *GarudaServer) gamemodeCommand(sender CommandSender, args []string) bool {
-    // Implementation for gamemode command
-    return true
-}
-
-func (s *GarudaServer) kickCommand(sender CommandSender, args []string) bool {
-    // Implementation for kick command
-    return true
-}
-
-func (s *GarudaServer) banCommand(sender CommandSender, args []string) bool {
-    // Implementation for ban command
-    return true
-}
-
-func (s *GarudaServer) pardonCommand(sender CommandSender, args []string) bool {
-    // Implementation for pardon command
-    return true
-}
-
-func (s *GarudaServer) opCommand(sender CommandSender, args []string) bool {
-    // Implementation for op command
-    return true
-}
-
-func (s *GarudaServer) deopCommand(sender CommandSender, args []string) bool {
-    // Implementation for deop command
-    return true
-}
-
-func (s *GarudaServer) whitelistCommand(sender CommandSender, args []string) bool {
-    // Implementation for whitelist command
-    return true
-}
-
-func (s *GarudaServer) saveCommand(sender CommandSender, args []string) bool {
-    if s.SaveWorld() {
-        sender.SendMessage("§aWorld saved successfully")
-    } else {
-        sender.SendMessage("§cFailed to save world")
-    }
-    return true
-}
-
-func (s *GarudaServer) stopCommand(sender CommandSender, args []string) bool {
-    if sender.HasPermission("server.stop") {
-        sender.SendMessage("§cStopping server...")
-        s.Stop()
-        return true
-    }
-    sender.SendMessage("§cYou don't have permission to stop the server")
-    return false
-}
-
-// ===== Command Sender Implementations =====
-
-// PlayerCommandSender implementation
-func (p *PlayerCommandSender) GetName() string {
-    return p.player.Username
-}
-
-func (p *PlayerCommandSender) HasPermission(permission string) bool {
-    // TODO: Implement permission system
-    return p.player.Username == "CONSOLE" || s.ops.IsOp(p.player.Username)
-}
-
-func (p *PlayerCommandSender) SendMessage(message string) {
-    s.SendMessageToPlayer(p.player, message)
-}
-
-func (p *PlayerCommandSender) IsPlayer() bool {
-    return true
-}
-
-func (p *PlayerCommandSender) GetPlayer() *world.Player {
-    return p.player
-}
-
-// ConsoleCommandSender implementation
-func (c *ConsoleCommandSender) GetName() string {
-    return c.name
-}
-
-func (c *ConsoleCommandSender) HasPermission(permission string) bool {
-    return true // Console has all permissions
-}
-
-func (c *ConsoleCommandSender) SendMessage(message string) {
-    log.Printf("[CONSOLE] %s", message)
-}
-
-func (c *ConsoleCommandSender) IsPlayer() bool {
-    return false
-}
-
-func (c *ConsoleCommandSender) GetPlayer() *world.Player {
     return nil
 }
 
-// ===== Manager Implementations =====
+// ===== INVENTORY SYSTEM INTEGRATION =====
 
-// BanManager implementation
-func NewBanManager() *BanManager {
-    return &BanManager{
-        bannedPlayers: make(map[string]BanEntry),
-        bannedIPs:     make(map[string]BanEntry),
-    }
-}
-
-func (bm *BanManager) BanPlayer(name, reason, source string) bool {
-    bm.mutex.Lock()
-    defer bm.mutex.Unlock()
-
-    entry := BanEntry{
-        Name:    name,
-        Reason:  reason,
-        Source:  source,
-        Created: time.Now(),
-        Permanent: true,
+func (s *Server) HandleInventoryTransaction(session *raknet.Session, transactionData []byte) {
+    s.playerMutex.RLock()
+    player, exists := s.players[session.GetAddress()]
+    s.playerMutex.RUnlock()
+    
+    if !exists {
+        return
     }
     
-    bm.bannedPlayers[strings.ToLower(name)] = entry
-    log.Printf("Player %s banned by %s: %s", name, source, reason)
-    return true
+    // Process inventory transaction
+    // TODO: Implement full transaction parsing
+    s.logger.Debug("Inventory transaction from player %s", player.Username)
 }
 
-// Implement other BanManager methods...
-
-// WhitelistManager implementation
-func NewWhitelistManager() *WhitelistManager {
-    return &WhitelistManager{
-        enabled: false,
-        players: make(map[string]WhitelistEntry),
-    }
-}
-
-func (wm *WhitelistManager) AddPlayer(name, addedBy string) bool {
-    wm.mutex.Lock()
-    defer wm.mutex.Unlock()
-
-    entry := WhitelistEntry{
-        Name:    name,
-        AddedBy: addedBy,
-        AddedAt: time.Now(),
+func (s *Server) HandleContainerClose(session *raknet.Session, windowID byte) {
+    s.playerMutex.RLock()
+    player, exists := s.players[session.GetAddress()]
+    s.playerMutex.RUnlock()
+    
+    if !exists {
+        return
     }
     
-    wm.players[strings.ToLower(name)] = entry
-    log.Printf("Player %s added to whitelist by %s", name, addedBy)
-    return true
+    s.logger.Debug("Player %s closed container window %d", player.Username, windowID)
 }
 
-// Implement other WhitelistManager methods...
+// ===== PLAYER MANAGEMENT =====
 
-// OpsManager implementation
-func NewOpsManager() *OpsManager {
-    return &OpsManager{
-        ops: make(map[string]OpEntry),
+func (s *Server) HandleLogin(session *raknet.Session, loginPacket *minecraft.LoginPacket) {
+    s.logger.Info("Handling login from session %s", session.GetAddress())
+    
+    statusPacket := &minecraft.PlayStatusPacket{Status: 0}
+    if packetData, err := statusPacket.Encode(); err == nil {
+        session.SendMinecraftPacket(packetData)
+    }
+    
+    player := s.createPlayer(session)
+    
+    s.playerMutex.Lock()
+    s.players[session.GetAddress()] = player
+    s.playerMutex.Unlock()
+    
+    s.sendStartGame(player)
+    s.sendSpawnChunks(player)
+    s.sendInventory(player)
+    
+    player.IsSpawned = true
+    
+    // Dispatch plugin event
+    s.pluginManager.DispatchPlayerJoin(player.WorldPlayer)
+    
+    s.logger.Info("Player %s joined the game", player.Username)
+    s.BroadcastMessage("Player " + player.Username + " joined the game")
+}
+
+func (s *Server) createPlayer(session *raknet.Session) *Player {
+    worldPlayer := world.NewPlayer("Player_"+session.GetAddress(), utils.FormatUUID(utils.GenerateUUID()), s.world, [3]float32{0, 60, 0})
+    
+    return &Player{
+        Username:    "Player_" + session.GetAddress(),
+        UUID:        utils.FormatUUID(utils.GenerateUUID()),
+        EntityID:    s.generateEntityID(),
+        RuntimeID:   uint64(s.generateEntityID()),
+        Session:     session,
+        Position:    [3]float32{0, 60, 0},
+        Rotation:    [2]float32{0, 0},
+        World:       s.world,
+        Gamemode:    1,
+        Health:      20.0,
+        IsSpawned:   false,
+        WorldPlayer: worldPlayer,
     }
 }
 
-func (om *OpsManager) AddOp(name string, level int) bool {
-    om.mutex.Lock()
-    defer om.mutex.Unlock()
-
-    entry := OpEntry{
-        Name:    name,
-        Level:   level,
-        BypassesPlayerLimit: true,
+func (s *Server) sendInventory(player *Player) {
+    inventoryPacket := &minecraft.InventoryContentPacket{
+        WindowID: 0,
+        Items:    make([]minecraft.ItemStack, 36),
     }
     
-    om.ops[strings.ToLower(name)] = entry
-    log.Printf("Player %s made operator (level %d)", name, level)
-    return true
-}
-
-// Implement other OpsManager methods...
-
-
-// ===== ENTITY MANAGEMENT =====
-
-// SpawnEntity spawns a new entity in the world
-func (s *GarudaServer) SpawnEntity(entityType world.EntityType, position minecraft.Vector3) *world.Entity {
-    entity := s.world.GetEntityManager().CreateEntity(entityType, position)
-    log.Printf("Spawned entity %v at %.1f,%.1f,%.1f", entityType, position.X, position.Y, position.Z)
-    return entity
-}
-
-// RemoveEntity removes an entity from the world
-func (s *GarudaServer) RemoveEntity(entity *world.Entity) {
-    s.world.GetEntityManager().RemoveEntity(entity.EntityID)
-    log.Printf("Removed entity %d", entity.EntityID)
-}
-
-// GetEntitiesInRange returns entities within radius of position
-func (s *GarudaServer) GetEntitiesInRange(position minecraft.Vector3, radius float32) []*world.Entity {
-    return s.world.GetEntityManager().GetEntitiesInRange(position, radius)
-}
-
-// GetEntityByID returns an entity by its ID
-func (s *GarudaServer) GetEntityByID(entityID int64) *world.Entity {
-    return s.world.GetEntityManager().GetEntity(entityID)
-}
-
-// ===== WORLD EDITING =====
-
-// SetBlock sets a block at the specified position
-func (s *GarudaServer) SetBlock(pos minecraft.BlockPos, block world.Block) {
-    oldBlock := s.world.GetBlock(pos)
-    s.world.SetBlock(pos, block)
-    log.Printf("Set block at %d,%d,%d: %d -> %d", pos.X, pos.Y, pos.Z, oldBlock.ID, block.ID)
-}
-
-// GetBlock returns the block at the specified position
-func (s *GarudaServer) GetBlock(pos minecraft.BlockPos) world.Block {
-    return s.world.GetBlock(pos)
-}
-
-// FillBlocks fills an area with the specified block
-func (s *GarudaServer) FillBlocks(start, end minecraft.BlockPos, block world.Block) int {
-    count := 0
-    minX, maxX := min(start.X, end.X), max(start.X, end.X)
-    minY, maxY := min(start.Y, end.Y), max(start.Y, end.Y) 
-    minZ, maxZ := min(start.Z, end.Z), max(start.Z, end.Z)
-    
-    for x := minX; x <= maxX; x++ {
-        for y := minY; y <= maxY; y++ {
-            for z := minZ; z <= maxZ; z++ {
-                pos := minecraft.BlockPos{X: x, Y: y, Z: z}
-                s.world.SetBlock(pos, block)
-                count++
-            }
+    for i := 0; i < 36; i++ {
+        item := player.WorldPlayer.GetItemInSlot(i)
+        inventoryPacket.Items[i] = minecraft.ItemStack{
+            ID:    item.ID,
+            Count: item.Count,
+            Data:  item.Data,
         }
     }
     
-    log.Printf("Filled %d blocks from %v to %v with block %d", count, start, end, block.ID)
-    return count
-}
-
-// ===== INVENTORY MANAGEMENT =====
-
-// GetPlayerInventory returns a player's inventory
-func (s *GarudaServer) GetPlayerInventory(player *world.Player) *world.Inventory {
-    return player.Inventory
-}
-
-// ClearPlayerInventory clears all items from a player's inventory
-func (s *GarudaServer) ClearPlayerInventory(player *world.Player) {
-    for i := 0; i < player.Inventory.size; i++ {
-        player.Inventory.SetItem(i, &world.ItemStack{ID: 0, Count: 0})
+    if packetData, err := inventoryPacket.Encode(); err == nil {
+        player.Session.SendMinecraftPacket(packetData)
     }
-    log.Printf("Cleared inventory of player %s", player.Username)
 }
 
-// SetPlayerInventorySlot sets an item in a specific inventory slot
-func (s *GarudaServer) SetPlayerInventorySlot(player *world.Player, slot int, item *world.ItemStack) bool {
-    if slot < 0 || slot >= player.Inventory.size {
-        return false
-    }
-    player.Inventory.SetItem(slot, item)
-    log.Printf("Set slot %d of player %s to item %d x%d", slot, player.Username, item.ID, item.Count)
-    return true
-}
-
-// GetPlayerInventorySlot returns the item in a specific inventory slot
-func (s *GarudaServer) GetPlayerInventorySlot(player *world.Player, slot int) *world.ItemStack {
-    if slot < 0 || slot >= player.Inventory.size {
-        return nil
-    }
-    return player.Inventory.GetItem(slot)
-}
-
-// ===== PERMISSION SYSTEM =====
-
-// HasPermission checks if a player has a specific permission
-func (s *GarudaServer) HasPermission(player *world.Player, permission string) bool {
-    // Basic implementation - ops have all permissions
-    return s.IsOp(player.Username)
-}
-
-// SetPlayerPermission sets a permission for a player (basic implementation)
-func (s *GarudaServer) SetPlayerPermission(player *world.Player, permission string, value bool) {
-    // For now, just log the request
-    log.Printf("Set permission %s for player %s to %t", permission, player.Username, value)
-}
-
-// GetPlayerPermissions returns all permissions for a player (basic implementation)
-func (s *GarudaServer) GetPlayerPermissions(player *world.Player) map[string]bool {
-    perms := make(map[string]bool)
-    if s.IsOp(player.Username) {
-        perms["*"] = true // Ops have all permissions
-    }
-    return perms
-}
-
-// ===== ECONOMY SYSTEM =====
-
-// GetPlayerBalance returns a player's balance
-func (s *GarudaServer) GetPlayerBalance(player *world.Player) int {
-    s.economyMutex.RLock()
-    defer s.economyMutex.RUnlock()
+func (s *Server) HandleInventoryClick(session *raknet.Session, slotPacket *minecraft.InventorySlotPacket) {
+    s.playerMutex.RLock()
+    player, exists := s.players[session.GetAddress()]
+    s.playerMutex.RUnlock()
     
-    if balance, exists := s.playerBalances[player.Username]; exists {
-        return balance
-    }
-    return 0 // Default balance
-}
-
-// SetPlayerBalance sets a player's balance
-func (s *GarudaServer) SetPlayerBalance(player *world.Player, amount int) {
-    s.economyMutex.Lock()
-    defer s.economyMutex.Unlock()
-    
-    s.playerBalances[player.Username] = amount
-    log.Printf("Set balance of player %s to %d", player.Username, amount)
-}
-
-// AddPlayerBalance adds to a player's balance
-func (s *GarudaServer) AddPlayerBalance(player *world.Player, amount int) int {
-    s.economyMutex.Lock()
-    defer s.economyMutex.Unlock()
-    
-    current := s.playerBalances[player.Username]
-    newBalance := current + amount
-    s.playerBalances[player.Username] = newBalance
-    
-    log.Printf("Added %d to player %s balance: %d -> %d", amount, player.Username, current, newBalance)
-    return newBalance
-}
-
-// TransferBalance transfers balance between players
-func (s *GarudaServer) TransferBalance(from, to *world.Player, amount int) bool {
-    s.economyMutex.Lock()
-    defer s.economyMutex.Unlock()
-    
-    fromBalance := s.playerBalances[from.Username]
-    if fromBalance < amount {
-        return false
+    if !exists {
+        return
     }
     
-    s.playerBalances[from.Username] = fromBalance - amount
-    s.playerBalances[to.Username] += amount
+    item := world.ItemStack{
+        ID:    slotPacket.Item.ID,
+        Count: slotPacket.Item.Count,
+        Data:  slotPacket.Item.Data,
+    }
     
-    log.Printf("Transferred %d from %s to %s", amount, from.Username, to.Username)
-    return true
+    player.WorldPlayer.SetItemInSlot(int(slotPacket.Slot), item)
+    s.logger.Debug("Player %s updated slot %d to item %d", player.Username, slotPacket.Slot, item.ID)
 }
 
-// ===== ENTITY CONTROL =====
-
-// DamageEntity damages an entity
-func (s *GarudaServer) DamageEntity(entity *world.Entity, damage float32, source *world.Entity) {
-    s.world.GetCombatManager().DamageEntity(entity, damage, source)
+func (s *Server) generateEntityID() int64 {
+    return time.Now().UnixNano() + int64(len(s.players))
 }
 
-// HealEntity heals an entity
-func (s *GarudaServer) HealEntity(entity *world.Entity, amount float32) {
-    if entity.Health+amount > entity.MaxHealth {
-        entity.Health = entity.MaxHealth
-    } else {
-        entity.Health += amount
+func (s *Server) sendStartGame(player *Player) {
+    startGamePacket := &minecraft.StartGamePacket{
+        EntityID:       player.EntityID,
+        RuntimeID:      player.RuntimeID,
+        PlayerGamemode: player.Gamemode,
+        Position:       player.Position,
+        WorldName:      s.config.World.Name,
+    }
+    
+    if packetData, err := startGamePacket.Encode(); err == nil {
+        player.Session.SendMinecraftPacket(packetData)
     }
 }
 
-// SetEntityMotion sets an entity's motion
-func (s *GarudaServer) SetEntityMotion(entity *world.Entity, motion minecraft.Vector3) {
-    entity.Motion = motion
+func (s *Server) sendSpawnChunks(player *Player) {
+    centerX := int32(player.Position[0]) >> 4
+    centerZ := int32(player.Position[2]) >> 4
+    
+    viewDistance := s.config.World.ViewDistance
+    if viewDistance <= 0 {
+        viewDistance = 8
+    }
+    
+    for x := centerX - int32(viewDistance); x <= centerX+int32(viewDistance); x++ {
+        for z := centerZ - int32(viewDistance); z <= centerZ+int32(viewDistance); z++ {
+            chunk := s.world.GetChunk(x, z)
+            s.sendChunkToPlayer(player, chunk)
+        }
+    }
+    
+    s.logger.Debug("Sent %d chunks to player %s", (viewDistance*2+1)*(viewDistance*2+1), player.Username)
 }
 
-// ===== WORLD INFORMATION =====
-
-// GetWorldTime returns the current world time
-func (s *GarudaServer) GetWorldTime() int64 {
-    return s.world.GetTime()
-}
-
-// GetWorldName returns the world name
-func (s *GarudaServer) GetWorldName() string {
-    return s.world.GetName()
-}
-
-// GetWorldSeed returns the world seed
-func (s *GarudaServer) GetWorldSeed() int64 {
-    return s.world.GetSeed()
-}
-
-// ===== PLAYER STATE MANAGEMENT =====
-
-// SetPlayerGameMode sets a player's game mode
-func (s *GarudaServer) SetPlayerGameMode(player *world.Player, gameMode int32) {
-    player.GameMode = gameMode
-    log.Printf("Set game mode of player %s to %d", player.Username, gameMode)
-}
-
-// SetPlayerHealth sets a player's health
-func (s *GarudaServer) SetPlayerHealth(player *world.Player, health float32) {
-    if health < 0 {
-        player.Health = 0
-    } else if health > player.MaxHealth {
-        player.Health = player.MaxHealth
-    } else {
-        player.Health = health
+func (s *Server) sendChunkToPlayer(player *Player, chunk *world.Chunk) {
+    chunkData := chunk.Encode()
+    
+    chunkPacket := &world.LevelChunkPacket{
+        ChunkX:        chunk.X,
+        ChunkZ:        chunk.Z,
+        SubChunkCount: 16,
+        Data:          chunkData,
+    }
+    
+    if packetData, err := chunkPacket.Encode(); err == nil {
+        player.Session.SendMinecraftPacket(packetData)
     }
 }
 
-// SetPlayerHunger sets a player's hunger
-func (s *GarudaServer) SetPlayerHunger(player *world.Player, hunger int32) {
-    if hunger < 0 {
-        player.Hunger = 0
-    } else if hunger > 20 {
-        player.Hunger = 20
-    } else {
-        player.Hunger = hunger
+func (s *Server) HandleDisconnect(session *raknet.Session) {
+    s.playerMutex.Lock()
+    defer s.playerMutex.Unlock()
+    
+    if player, exists := s.players[session.GetAddress()]; exists {
+        s.pluginManager.DispatchPlayerQuit(player.WorldPlayer, "disconnected")
+        s.logger.Info("Player %s left the game", player.Username)
+        s.BroadcastMessage("Player " + player.Username + " left the game")
+        delete(s.players, session.GetAddress())
     }
 }
 
-// ===== UTILITY FUNCTIONS =====
-
-func min(a, b int32) int32 {
-    if a < b {
-        return a
+func (s *Server) HandleMovePlayer(session *raknet.Session, movePacket *minecraft.MovePlayerPacket) {
+    s.playerMutex.RLock()
+    player, exists := s.players[session.GetAddress()]
+    s.playerMutex.RUnlock()
+    
+    if !exists {
+        return
     }
-    return b
+    
+    fromPos := player.Position
+    player.Position = movePacket.Position
+    player.Rotation = [2]float32{movePacket.Pitch, movePacket.Yaw}
+    
+    // Dispatch plugin event
+    event := s.pluginManager.DispatchPlayerMove(player.WorldPlayer, fromPos, player.Position)
+    if event.IsCancelled() {
+        player.Position = fromPos // Revert position if cancelled
+        return
+    }
+    
+    s.logger.Debug("Player %s moved to %.1f,%.1f,%.1f", 
+        player.Username, 
+        player.Position[0], 
+        player.Position[1], 
+        player.Position[2])
 }
 
-func max(a, b int32) int32 {
-    if a > b {
-        return a
+func (s *Server) HandleChatMessage(session *raknet.Session, textPacket *minecraft.TextPacket) {
+    s.playerMutex.RLock()
+    player, exists := s.players[session.GetAddress()]
+    s.playerMutex.RUnlock()
+    
+    if !exists || textPacket.Message == "" {
+        return
     }
-    return b
+    
+    // Dispatch plugin event
+    processedMessage := s.pluginManager.DispatchPlayerChat(player.WorldPlayer, textPacket.Message)
+    if processedMessage == "" {
+        return // Message was cancelled by plugin
+    }
+    
+    chatMessage := "<" + player.Username + "> " + processedMessage
+    s.logger.Info("[CHAT] %s", chatMessage)
+    s.BroadcastMessage(chatMessage)
+}
+
+func (s *Server) HandleBlockBreak(session *raknet.Session, actionPacket *minecraft.PlayerActionPacket) {
+    s.playerMutex.RLock()
+    player, exists := s.players[session.GetAddress()]
+    s.playerMutex.RUnlock()
+    
+    if !exists {
+        return
+    }
+    
+    blockPos := [3]int{int(actionPacket.Position.X), int(actionPacket.Position.Y), int(actionPacket.Position.Z)}
+    block := s.world.GetBlock(blockPos[0], blockPos[1], blockPos[2])
+    
+    // Dispatch plugin event
+    event := s.pluginManager.DispatchPlayerBreakBlock(player.WorldPlayer, blockPos, block.ID)
+    if event.IsCancelled() {
+        return
+    }
+    
+    if s.world.BreakBlock(blockPos[0], blockPos[1], blockPos[2], player.WorldPlayer) {
+        s.logger.Debug("Player %s broke block at %d,%d,%d", player.Username, blockPos[0], blockPos[1], blockPos[2])
+    }
+}
+
+func (s *Server) HandleBlockPlace(session *raknet.Session, blockPacket *minecraft.UpdateBlockPacket) {
+    s.playerMutex.RLock()
+    player, exists := s.players[session.GetAddress()]
+    s.playerMutex.RUnlock()
+    
+    if !exists {
+        return
+    }
+    
+    blockPos := [3]int{int(blockPacket.Position.X), int(blockPacket.Position.Y), int(blockPacket.Position.Z)}
+    
+    // Dispatch plugin event
+    event := s.pluginManager.DispatchPlayerPlaceBlock(player.WorldPlayer, blockPos, blockPacket.BlockID)
+    if event.IsCancelled() {
+        return
+    }
+    
+    if s.world.PlaceBlock(blockPos[0], blockPos[1], blockPos[2], blockPacket.BlockID, player.WorldPlayer) {
+        s.logger.Debug("Player %s placed block %d at %d,%d,%d", 
+            player.Username, blockPacket.BlockID, blockPos[0], blockPos[1], blockPos[2])
+    }
+}
+
+// ===== BROADCAST METHODS =====
+
+func (s *Server) BroadcastMessage(message string) {
+    textPacket := &minecraft.TextPacket{
+        TextType: 1,
+        Message:  message,
+    }
+    
+    packetData, err := textPacket.Encode()
+    if err != nil {
+        s.logger.Error("Failed to encode chat message: %v", err)
+        return
+    }
+    
+    s.BroadcastPacket(packetData)
+}
+
+func (s *Server) BroadcastPacket(packetData []byte) {
+    s.playerMutex.RLock()
+    defer s.playerMutex.RUnlock()
+    
+    for _, player := range s.players {
+        if player.IsSpawned {
+            player.Session.SendMinecraftPacket(packetData)
+        }
+    }
+}
+
+func (s *Server) BroadcastToOthers(sender *Player, packetData []byte) {
+    s.playerMutex.RLock()
+    defer s.playerMutex.RUnlock()
+    
+    for _, player := range s.players {
+        if player != sender && player.IsSpawned {
+            player.Session.SendMinecraftPacket(packetData)
+        }
+    }
+}
+
+func (s *Server) GetPlayerCount() int {
+    s.playerMutex.RLock()
+    defer s.playerMutex.RUnlock()
+    return len(s.players)
+}
+
+func (s *Server) GetMaxPlayers() int {
+    return s.config.Server.MaxPlayers
+}
+
+func (s *Server) Stop() {
+    s.running = false
+    if s.ticker != nil {
+        s.ticker.Stop()
+    }
+    
+    s.playerMutex.Lock()
+    for _, player := range s.players {
+        disconnectPacket := &minecraft.DisconnectPacket{
+            HideDisconnectionScreen: false,
+            Message: "Server closed",
+        }
+        if packetData, err := disconnectPacket.Encode(); err == nil {
+            player.Session.SendMinecraftPacket(packetData)
+        }
+    }
+    s.players = make(map[string]*Player)
+    s.playerMutex.Unlock()
+    
+    s.raknetServer.Close()
+    s.logger.Info("Minecraft server stopped")
 }

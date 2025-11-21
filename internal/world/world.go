@@ -1,539 +1,272 @@
 package world
 
 import (
-    "log"
-    "math"
-    "math/rand"
+    "garuda/pkg/utils"
     "sync"
-    "time"
-
-    "garuda/internal/protocol/minecraft"
 )
 
 type World struct {
-    name          string
-    seed          int64
-    chunks        map[ChunkCoord]*Chunk
-    chunksMutex   sync.RWMutex
-    players       map[int64]*Player
-    playersMutex  sync.RWMutex
-    entities      map[int64]*Entity
-    entitiesMutex sync.RWMutex
-    generator     Generator
-    entityManager *EntityManager
-    combatManager *CombatManager
-    random        *rand.Rand
-    time          int64
-    daytime       int64
-    weather       WeatherType
-    running       bool
-    spawnPoint    minecraft.Vector3
-    difficulty    int
-    gameRules     map[string]GameRule
+    Name          string
+    Seed          string
+    Chunks        map[string]*Chunk
+    BlockRegistry *BlockRegistry
+    PhysicsEngine *PhysicsEngine
+    mutex         sync.RWMutex
+    logger        *utils.Logger
 }
 
-type WeatherType int
-
-const (
-    WeatherClear WeatherType = iota
-    WeatherRain
-    WeatherThunderstorm
-)
-
-type GameRule struct {
-    Name  string
-    Value interface{}
-    Type  string // "bool", "int", "float"
-}
-
-func NewWorld(name string, seed int64) *World {
+func NewWorld(name, seed string, logger *utils.Logger) *World {
+    blockRegistry := NewBlockRegistry()
     world := &World{
-        name:       name,
-        seed:       seed,
-        chunks:     make(map[ChunkCoord]*Chunk),
-        players:    make(map[int64]*Player),
-        entities:   make(map[int64]*Entity),
-        generator:  NewFlatGenerator(),
-        random:     rand.New(rand.NewSource(seed)),
-        time:       0,
-        daytime:    6000, // Start at noon
-        weather:    WeatherClear,
-        running:    true,
-        spawnPoint: minecraft.Vector3{X: 0, Y: 70, Z: 0},
-        difficulty: 2, // Normal
-        gameRules:  make(map[string]GameRule),
+        Name:          name,
+        Seed:          seed,
+        Chunks:        make(map[string]*Chunk),
+        BlockRegistry: blockRegistry,
+        logger:        logger,
     }
-
-    // Initialize default game rules
-    world.initializeGameRules()
-
-    world.entityManager = NewEntityManager(world)
-    world.combatManager = NewCombatManager(world)
-
-    // Start world tick loop
-    go world.tickLoop()
-
-    log.Printf("World '%s' created with seed %d", name, seed)
+    
+    world.PhysicsEngine = NewPhysicsEngine(world, blockRegistry)
     return world
 }
 
-func (w *World) initializeGameRules() {
-    w.gameRules["doDaylightCycle"] = GameRule{Name: "doDaylightCycle", Value: true, Type: "bool"}
-    w.gameRules["doWeatherCycle"] = GameRule{Name: "doWeatherCycle", Value: true, Type: "bool"}
-    w.gameRules["doMobSpawning"] = GameRule{Name: "doMobSpawning", Value: true, Type: "bool"}
-    w.gameRules["doFireTick"] = GameRule{Name: "doFireTick", Value: true, Type: "bool"}
-    w.gameRules["mobGriefing"] = GameRule{Name: "mobGriefing", Value: true, Type: "bool"}
-    w.gameRules["keepInventory"] = GameRule{Name: "keepInventory", Value: false, Type: "bool"}
-    w.gameRules["naturalRegeneration"] = GameRule{Name: "naturalRegeneration", Value: true, Type: "bool"}
-}
-
-func (w *World) tickLoop() {
-    ticker := time.NewTicker(50 * time.Millisecond) // 20 ticks per second
-    defer ticker.Stop()
-
-    for w.running {
-        <-ticker.C
-        w.tick()
-    }
-}
-
-func (w *World) tick() {
-    w.time++
-    w.daytime++
-
-    // Day/night cycle (20 minutes = 24000 ticks)
-    if w.daytime >= 24000 {
-        w.daytime = 0
-    }
-
-    // Update entities
-    w.entityManager.Update()
-
-    // Update weather
-    if w.time%12000 == 0 { // Every 10 minutes
-        w.updateWeather()
-    }
-
-    // Natural mob spawning
-    if w.getGameRuleBool("doMobSpawning") && w.time%200 == 0 {
-        w.naturalMobSpawning()
-    }
-
-    // Player regeneration
-    if w.getGameRuleBool("naturalRegeneration") && w.time%100 == 0 {
-        w.updatePlayerRegeneration()
-    }
-
-    // Time-based events
-    if w.time%20 == 0 { // Every second
-        w.handleTimeBasedEvents()
-    }
-}
-
-func (w *World) updateWeather() {
-    if !w.getGameRuleBool("doWeatherCycle") {
-        return
-    }
-
-    // Simple weather transition
-    if w.random.Float32() < 0.3 {
-        if w.weather == WeatherClear {
-            w.weather = WeatherRain
-            log.Printf("Weather changed to rain")
-        } else if w.weather == WeatherRain && w.random.Float32() < 0.2 {
-            w.weather = WeatherThunderstorm
-            log.Printf("Weather changed to thunderstorm")
-        }
-    } else if w.random.Float32() < 0.1 {
-        w.weather = WeatherClear
-        log.Printf("Weather cleared")
-    }
-}
-
-func (w *World) updatePlayerRegeneration() {
-    w.playersMutex.RLock()
-    defer w.playersMutex.RUnlock()
-
-    for _, player := range w.players {
-        if player.Health < player.MaxHealth && player.Hunger >= 18 {
-            player.Health = math.Min(player.Health+1.0, player.MaxHealth)
-            player.Hunger -= 0.5
-        }
-
-        // Hunger regeneration when not hungry
-        if player.Hunger < 20 && w.time%800 == 0 {
-            player.Hunger++
-        }
-    }
-}
-
-func (w *World) handleTimeBasedEvents() {
-    // Time-specific events (monster spawning at night, etc.)
-    isNight := w.daytime > 13000 && w.daytime < 23000
-
-    if isNight {
-        // Increase mob spawn rates at night
-        if w.time%100 == 0 {
-            w.naturalMobSpawning()
-        }
-    }
-}
-
-func (w *World) naturalMobSpawning() {
-    w.playersMutex.RLock()
-    players := make([]*Player, 0, len(w.players))
-    for _, player := range w.players {
-        players = append(players, player)
-    }
-    w.playersMutex.RUnlock()
-
-    for _, player := range players {
-        if w.random.Float32() < 0.3 {
-            w.spawnMobsNearPlayer(player, 1, 3) // Spawn 1-3 mobs
-        }
-    }
-}
-
-func (w *World) spawnMobsNearPlayer(player *Player, minCount, maxCount int) {
-    count := minCount + w.random.Intn(maxCount-minCount+1)
-
-    for i := 0; i < count; i++ {
-        // Spawn position near player but not too close
-        angle := w.random.Float64() * 2 * math.Pi
-        distance := 12 + w.random.Float64()*8
-        x := player.Position.X + float32(math.Cos(angle)*distance)
-        z := player.Position.Z + float32(math.Sin(angle)*distance)
-
-        // Find suitable spawn location
-        y := w.findSpawnLocation(int32(x), int32(z))
-        if y > 0 {
-            var mobType EntityType
-
-            // Different mobs based on time and location
-            isNight := w.daytime > 13000 && w.daytime < 23000
-            if isNight && w.random.Float32() < 0.7 {
-                // Hostile mobs at night
-                hostileMobs := []EntityType{EntityZombie, EntitySkeleton, EntityCreeper, EntitySpider}
-                mobType = hostileMobs[w.random.Intn(len(hostileMobs))]
-            } else {
-                // Passive mobs during day
-                passiveMobs := []EntityType{EntityCow, EntityPig, EntitySheep, EntityChicken}
-                mobType = passiveMobs[w.random.Intn(len(passiveMobs))]
-            }
-
-            entity := w.entityManager.CreateEntity(mobType, minecraft.Vector3{
-                X: x,
-                Y: float32(y) + 1.0,
-                Z: z,
-            })
-
-            log.Printf("Spawned %s at %.1f,%.1f,%.1f near %s", 
-                w.getEntityTypeName(mobType), x, float32(y)+1.0, z, player.Username)
-        }
-    }
-}
-
-func (w *World) findSpawnLocation(x, z int32) int32 {
-    chunkX := x >> 4
-    chunkZ := z >> 4
-    localX := x & 0xF
-    localZ := z & 0xF
-
-    chunk := w.GetChunk(chunkX, chunkZ)
-
-    // Find highest solid block with air above
-    for y := ChunkHeight - 2; y >= 0; y-- {
-        block := chunk.GetBlock(localX, int32(y), localZ)
-        blockAbove := chunk.GetBlock(localX, int32(y+1), localZ)
-
-        if block.ID != 0 && blockAbove.ID == 0 {
-            // Check if block is spawnable (not leaves, glass, etc.)
-            if w.isSpawnableBlock(block) {
-                return int32(y)
-            }
-        }
-    }
-
-    return -1
-}
-
-func (w *World) isSpawnableBlock(block Block) bool {
-    // Blocks that mobs can spawn on
-    spawnableBlocks := map[uint16]bool{
-        1: true,  // Stone
-        2: true,  // Grass
-        3: true,  // Dirt
-        4: true,  // Cobblestone
-        5: true,  // Wood
-        6: true,  // Planks
-        7: false, // Bedrock
-        8: false, // Water
-        9: false, // Water
-        12: true, // Sand
-        13: true, // Gravel
-        17: true, // Wood
-        18: false, // Leaves
-    }
-
-    return spawnableBlocks[block.ID]
-}
-
-func (w *World) getEntityTypeName(entityType EntityType) string {
-    switch entityType {
-    case EntityZombie:
-        return "Zombie"
-    case EntitySkeleton:
-        return "Skeleton"
-    case EntityCreeper:
-        return "Creeper"
-    case EntitySpider:
-        return "Spider"
-    case EntityCow:
-        return "Cow"
-    case EntityPig:
-        return "Pig"
-    case EntitySheep:
-        return "Sheep"
-    case EntityChicken:
-        return "Chicken"
-    default:
-        return "Unknown"
-    }
-}
-
-// World management methods
-func (w *World) GetName() string {
-    return w.name
-}
-
-func (w *World) GetSeed() int64 {
-    return w.seed
-}
-
-func (w *World) GetTime() int64 {
-    return w.time
-}
-
-func (w *World) GetDayTime() int64 {
-    return w.daytime
-}
-
-func (w *World) GetSpawnPoint() minecraft.Vector3 {
-    return w.spawnPoint
-}
-
-func (w *World) SetSpawnPoint(pos minecraft.Vector3) {
-    w.spawnPoint = pos
-}
-
-func (w *World) GetDifficulty() int {
-    return w.difficulty
-}
-
-func (w *World) SetDifficulty(difficulty int) {
-    w.difficulty = difficulty
-}
-
-// Chunk management
 func (w *World) GetChunk(x, z int32) *Chunk {
-    coord := ChunkCoord{X: x, Z: z}
-
-    w.chunksMutex.RLock()
-    chunk, exists := w.chunks[coord]
-    w.chunksMutex.RUnlock()
-
+    key := chunkKey(x, z)
+    
+    w.mutex.RLock()
+    chunk, exists := w.Chunks[key]
+    w.mutex.RUnlock()
+    
     if exists {
         return chunk
     }
-
-    // Generate new chunk
-    return w.generateChunk(x, z)
+    
+    return w.GenerateChunk(x, z)
 }
 
-func (w *World) generateChunk(x, z int32) *Chunk {
-    chunk := w.generator.GenerateChunk(x, z)
-
-    w.chunksMutex.Lock()
-    w.chunks[ChunkCoord{X: x, Z: z}] = chunk
-    w.chunksMutex.Unlock()
-
-    log.Printf("Generated chunk at %d,%d", x, z)
+func (w *World) GenerateChunk(x, z int32) *Chunk {
+    w.mutex.Lock()
+    defer w.mutex.Unlock()
+    
+    key := chunkKey(x, z)
+    
+    if chunk, exists := w.Chunks[key]; exists {
+        return chunk
+    }
+    
+    chunk := NewChunk(x, z)
+    w.generateTerrain(chunk)
+    w.Chunks[key] = chunk
+    
+    w.logger.Debug("Generated chunk at %d, %d", x, z)
     return chunk
 }
 
-func (w *World) SaveChunk(x, z int32) error {
-    // TODO: Implement chunk saving to disk
-    return nil
-}
-
-func (w *World) UnloadChunk(x, z int32) {
-    coord := ChunkCoord{X: x, Z: z}
-
-    w.chunksMutex.Lock()
-    delete(w.chunks, coord)
-    w.chunksMutex.Unlock()
-
-    log.Printf("Unloaded chunk at %d,%d", x, z)
-}
-
-// Block management
-func (w *World) GetBlock(pos minecraft.BlockPos) Block {
-    chunkX := pos.X >> 4
-    chunkZ := pos.Z >> 4
-    localX := pos.X & 0xF
-    localZ := pos.Z & 0xF
-
-    chunk := w.GetChunk(chunkX, chunkZ)
-    return chunk.GetBlock(localX, pos.Y, localZ)
-}
-
-func (w *World) SetBlock(pos minecraft.BlockPos, block Block) {
-    chunkX := pos.X >> 4
-    chunkZ := pos.Z >> 4
-    localX := pos.X & 0xF
-    localZ := pos.Z & 0xF
-
-    chunk := w.GetChunk(chunkX, chunkZ)
-    chunk.SetBlock(localX, pos.Y, localZ, block)
-
-    // TODO: Send block update to nearby players
-}
-
-// Player management
-func (w *World) AddPlayer(player *Player) {
-    w.playersMutex.Lock()
-    defer w.playersMutex.Unlock()
-
-    w.players[player.EntityID] = player
-    log.Printf("Player %s joined world %s", player.Username, w.name)
-}
-
-func (w *World) RemovePlayer(entityID int64) {
-    w.playersMutex.Lock()
-    defer w.playersMutex.Unlock()
-
-    if player, exists := w.players[entityID]; exists {
-        log.Printf("Player %s left world %s", player.Username, w.name)
-        delete(w.players, entityID)
-    }
-}
-
-func (w *World) GetPlayer(entityID int64) *Player {
-    w.playersMutex.RLock()
-    defer w.playersMutex.RUnlock()
-
-    return w.players[entityID]
-}
-
-func (w *World) GetPlayerByName(name string) *Player {
-    w.playersMutex.RLock()
-    defer w.playersMutex.RUnlock()
-
-    for _, player := range w.players {
-        if player.Username == name {
-            return player
-        }
-    }
-    return nil
-}
-
-func (w *World) GetOnlinePlayers() []*Player {
-    w.playersMutex.RLock()
-    defer w.playersMutex.RUnlock()
-
-    players := make([]*Player, 0, len(w.players))
-    for _, player := range w.players {
-        players = append(players, player)
-    }
-    return players
-}
-
-// Entity management
-func (w *World) GetEntityManager() *EntityManager {
-    return w.entityManager
-}
-
-func (w *World) GetCombatManager() *CombatManager {
-    return w.combatManager
-}
-
-// Game rules
-func (w *World) GetGameRule(name string) (GameRule, bool) {
-    rule, exists := w.gameRules[name]
-    return rule, exists
-}
-
-func (w *World) SetGameRule(name string, value interface{}) bool {
-    if rule, exists := w.gameRules[name]; exists {
-        // Type checking based on existing rule
-        switch rule.Type {
-        case "bool":
-            if _, ok := value.(bool); ok {
-                rule.Value = value
-                w.gameRules[name] = rule
-                return true
+func (w *World) generateTerrain(chunk *Chunk) {
+    for x := 0; x < ChunkWidth; x++ {
+        for z := 0; z < ChunkLength; z++ {
+            worldX := int(chunk.X)*ChunkWidth + x
+            worldZ := int(chunk.Z)*ChunkLength + z
+            
+            height := w.getHeightAt(worldX, worldZ)
+            
+            chunk.SetBlock(x, 0, z, Block{ID: 7})
+            
+            for y := 1; y < height-3; y++ {
+                chunk.SetBlock(x, y, z, Block{ID: 1})
             }
-        case "int":
-            if _, ok := value.(int); ok {
-                rule.Value = value
-                w.gameRules[name] = rule
-                return true
+            
+            for y := height - 3; y < height-1; y++ {
+                chunk.SetBlock(x, y, z, Block{ID: 3})
             }
-        case "float":
-            if _, ok := value.(float64); ok {
-                rule.Value = value
-                w.gameRules[name] = rule
-                return true
+            
+            chunk.SetBlock(x, height-1, z, Block{ID: 2})
+            
+            if x%4 == 0 && z%4 == 0 && height < ChunkHeight-2 {
+                chunk.SetBlock(x, height, z, Block{ID: 17})
+                for ly := height + 1; ly <= height+4; ly++ {
+                    if ly < ChunkHeight {
+                        chunk.SetBlock(x, ly, z, Block{ID: 18})
+                    }
+                }
+            }
+            
+            if x%3 == 0 && z%3 == 0 {
+                chunk.SetBlock(x, height, z, Block{ID: 31})
+            } else if x%5 == 0 && z%5 == 0 {
+                chunk.SetBlock(x, height, z, Block{ID: 37})
             }
         }
     }
-    return false
 }
 
-func (w *World) getGameRuleBool(name string) bool {
-    if rule, exists := w.gameRules[name]; exists && rule.Type == "bool" {
-        return rule.Value.(bool)
+func (w *World) getHeightAt(x, z int) int {
+    noise := float32((x*x + z*z) % 10)
+    return 55 + int(noise)
+}
+
+func (w *World) SetBlock(x, y, z int, block Block) {
+    if y < 0 || y >= ChunkHeight {
+        return
     }
-    return false
-}
-
-// Utility methods
-func (w *World) findGroundLevel(x, z int32) int32 {
+    
     chunkX := x >> 4
     chunkZ := z >> 4
-    localX := x & 0xF
-    localZ := z & 0xF
+    localX := x & (ChunkWidth - 1)
+    localZ := z & (ChunkLength - 1)
+    
+    chunk := w.GetChunk(int32(chunkX), int32(chunkZ))
+    chunk.SetBlock(localX, y, localZ, block)
+    
+    w.PhysicsEngine.UpdateBlockPhysics(x, y, z)
+}
 
-    chunk := w.GetChunk(chunkX, chunkZ)
+func (w *World) GetBlock(x, y, z int) Block {
+    if y < 0 || y >= ChunkHeight {
+        return Block{ID: 0}
+    }
+    
+    chunkX := x >> 4
+    chunkZ := z >> 4
+    localX := x & (ChunkWidth - 1)
+    localZ := z & (ChunkLength - 1)
+    
+    chunk := w.GetChunk(int32(chunkX), int32(chunkZ))
+    return chunk.GetBlock(localX, y, localZ)
+}
 
-    // Find highest non-air block
-    for y := ChunkHeight - 1; y >= 0; y-- {
-        block := chunk.GetBlock(localX, int32(y), localZ)
-        if block.ID != 0 {
-            return int32(y)
+func (w *World) BreakBlock(x, y, z int, player *Player) bool {
+    block := w.GetBlock(x, y, z)
+    if block.ID == 0 {
+        return false
+    }
+    
+    blockInfo := w.BlockRegistry.GetBlock(block.ID)
+    if blockInfo == nil || !blockInfo.Diggable {
+        return false
+    }
+    
+    selectedItem := player.GetSelectedItem()
+    canHarvest := w.BlockRegistry.CanHarvestWith(block.ID, selectedItem.ID)
+    digTime := w.BlockRegistry.GetDigTime(block.ID, selectedItem.ID, canHarvest)
+    
+    if digTime < 0 {
+        return false
+    }
+    
+    w.SetBlock(x, y, z, Block{ID: 0})
+    
+    if canHarvest {
+        w.dropBlockDrops(x, y, z, block.ID, player)
+    }
+    
+    w.logger.Debug("Block broken at %d,%d,%d by %s", x, y, z, player.Username)
+    return true
+}
+
+func (w *World) PlaceBlock(x, y, z int, blockID uint32, player *Player) bool {
+    if blockID == 0 {
+        return false
+    }
+    
+    currentBlock := w.GetBlock(x, y, z)
+    if currentBlock.ID != 0 {
+        return false
+    }
+    
+    if !w.canPlaceBlockAt(x, y, z, blockID) {
+        return false
+    }
+    
+    w.SetBlock(x, y, z, Block{ID: blockID})
+    
+    w.logger.Debug("Block placed at %d,%d,%d by %s", x, y, z, player.Username)
+    return true
+}
+
+func (w *World) canPlaceBlockAt(x, y, z int, blockID uint32) bool {
+    if y >= ChunkHeight-1 {
+        return false
+    }
+    
+    block := w.BlockRegistry.GetBlock(blockID)
+    if block == nil {
+        return false
+    }
+    
+    if block.BoundingBox == "empty" {
+        return true
+    }
+    
+    for _, offset := range [][3]int{{0, 0, 0}, {0, 1, 0}} {
+        checkX, checkY, checkZ := x+offset[0], y+offset[1], z+offset[2]
+        neighbor := w.GetBlock(checkX, checkY, checkZ)
+        if neighbor.ID != 0 && w.BlockRegistry.IsSolid(neighbor.ID) {
+            return false
         }
     }
-
-    return -1
+    
+    return true
 }
 
-func (w *World) BroadcastMessage(message string) {
-    players := w.GetOnlinePlayers()
-    for _, player := range players {
-        // TODO: Send chat message to player
-        log.Printf("[CHAT to %s] %s", player.Username, message)
+func (w *World) dropBlockDrops(x, y, z int, blockID uint32, player *Player) {
+    drops := w.getBlockDrops(blockID, player)
+    
+    for _, drop := range drops {
+        itemEntity := NewItemEntity(drop.ID, drop.Count, [3]float32{float32(x) + 0.5, float32(y) + 0.5, float32(z) + 0.5})
+        w.PhysicsEngine.world.entityManager.SpawnItem(drop.ID, w, itemEntity.GetPosition())
     }
 }
 
-func (w *World) Stop() {
-    w.running = false
-
-    // Save all chunks
-    w.chunksMutex.RLock()
-    for coord := range w.chunks {
-        w.SaveChunk(coord.X, coord.Z)
+func (w *World) getBlockDrops(blockID uint32, player *Player) []ItemStack {
+    switch blockID {
+    case 1: // Stone
+        return []ItemStack{{ID: 1, Count: 1, Data: 0}}
+    case 2: // Grass
+        return []ItemStack{{ID: 3, Count: 1, Data: 0}}
+    case 3: // Dirt
+        return []ItemStack{{ID: 3, Count: 1, Data: 0}}
+    case 16: // Coal Ore
+        return []ItemStack{{ID: 263, Count: 1, Data: 0}}
+    case 15: // Iron Ore
+        return []ItemStack{{ID: 265, Count: 1, Data: 0}}
+    case 14: // Gold Ore
+        return []ItemStack{{ID: 266, Count: 1, Data: 0}}
+    case 56: // Diamond Ore
+        return []ItemStack{{ID: 264, Count: 1, Data: 0}}
+    case 17: // Oak Log
+        return []ItemStack{{ID: 17, Count: 1, Data: 0}}
+    case 18: // Oak Leaves
+        if w.randomFloat() < 0.05 {
+            return []ItemStack{{ID: 6, Count: 1, Data: 0}}
+        }
+        return nil
+    default:
+        return []ItemStack{{ID: blockID, Count: 1, Data: 0}}
     }
-    w.chunksMutex.RUnlock()
-
-    log.Printf("World '%s' stopped", w.name)
 }
+
+func (w *World) randomFloat() float32 {
+    return float32((w.Seed[0] * byte(w.Seed[1])) % 100) / 100.0
+}
+
+func NewItemEntity(itemID uint32, count byte, position [3]float32) *Entity {
+    entity := &Entity{
+        ID:       -1,
+        Type:     EntityItem,
+        Position: position,
+        Rotation: [2]float32{0, 0},
+        Velocity: [3]float32{0, 0, 0},
+        Health:   1.0,
+        MaxHealth: 1.0,
+        Metadata: make(map[string]interface{}),
+    }
+    
+    entity.Metadata["item_id"] = itemID
+    entity.Metadata["item_count"] = count
+    
+    return entity
+}
+
+func chunkKey(x, z int32) string {
+    return string(rune(x)) + ":" + string(rune(z))
+}   

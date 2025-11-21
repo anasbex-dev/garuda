@@ -1,193 +1,120 @@
 package minecraft
 
 import (
-    "bytes"
     "encoding/binary"
-    "fmt"
+    "garuda/pkg/utils"
+    "math"
 )
 
-type PacketDecoder struct {
-    buffer *bytes.Buffer
+type Decoder struct {
+    stream *utils.BinaryStream
 }
 
-func NewPacketDecoder(data []byte) *PacketDecoder {
-    return &PacketDecoder{
-        buffer: bytes.NewBuffer(data),
+func NewDecoder(data []byte) *Decoder {
+    return &Decoder{
+        stream: utils.NewBinaryStream(data),
     }
 }
 
-func (d *PacketDecoder) ReadByte() (byte, error) {
-    return d.buffer.ReadByte()
-}
-
-func (d *PacketDecoder) ReadBytes(n int) ([]byte, error) {
-    data := make([]byte, n)
-    _, err := d.buffer.Read(data)
-    return data, err
-}
-
-func (d *PacketDecoder) ReadBool() (bool, error) {
-    b, err := d.ReadByte()
-    return b != 0, err
-}
-
-func (d *PacketDecoder) ReadInt16() (int16, error) {
-    var value int16
-    err := binary.Read(d.buffer, binary.BigEndian, &value)
-    return value, err
-}
-
-func (d *PacketDecoder) ReadUint16() (uint16, error) {
-    var value uint16
-    err := binary.Read(d.buffer, binary.BigEndian, &value)
-    return value, err
-}
-
-func (d *PacketDecoder) ReadInt32() (int32, error) {
+func (d *Decoder) ReadVarInt() int32 {
     var value int32
-    err := binary.Read(d.buffer, binary.BigEndian, &value)
-    return value, err
-}
+    var position int
+    var currentByte byte
 
-func (d *PacketDecoder) ReadUint32() (uint32, error) {
-    var value uint32
-    err := binary.Read(d.buffer, binary.BigEndian, &value)
-    return value, err
-}
+    for {
+        currentByte = d.stream.ReadByte()
+        value |= int32(currentByte&0x7F) << position
 
-func (d *PacketDecoder) ReadInt64() (int64, error) {
-    var value int64
-    err := binary.Read(d.buffer, binary.BigEndian, &value)
-    return value, err
-}
-
-func (d *PacketDecoder) ReadUint64() (uint64, error) {
-    var value uint64
-    err := binary.Read(d.buffer, binary.BigEndian, &value)
-    return value, err
-}
-
-func (d *PacketDecoder) ReadFloat32() (float32, error) {
-    var value float32
-    err := binary.Read(d.buffer, binary.BigEndian, &value)
-    return value, err
-}
-
-func (d *PacketDecoder) ReadString() (string, error) {
-    length, err := d.ReadUint16()
-    if err != nil {
-        return "", err
-    }
-    
-    data, err := d.ReadBytes(int(length))
-    if err != nil {
-        return "", err
-    }
-    
-    return string(data), nil
-}
-
-func (d *PacketDecoder) ReadVarInt() (int32, error) {
-    var value uint32
-    for i := 0; i < 5; i++ {
-        b, err := d.ReadByte()
-        if err != nil {
-            return 0, err
-        }
-        
-        value |= uint32(b&0x7F) << (7 * i)
-        
-        if b&0x80 == 0 {
+        if (currentByte & 0x80) == 0 {
             break
         }
-    }
-    
-    return int32(value), nil
-}
 
-func (d *PacketDecoder) ReadVarLong() (int64, error) {
-    var value uint64
-    for i := 0; i < 10; i++ {
-        b, err := d.ReadByte()
-        if err != nil {
-            return 0, err
-        }
-        
-        value |= uint64(b&0x7F) << (7 * i)
-        
-        if b&0x80 == 0 {
-            break
+        position += 7
+        if position >= 32 {
+            return 0 // Error
         }
     }
-    
-    return int64(value), nil
+
+    return value
 }
 
-func DecodeLoginPacket(data []byte) (*LoginPacket, error) {
-    if len(data) < 1 {
-        return nil, fmt.Errorf("packet too short")
+func (d *Decoder) ReadString() string {
+    length := d.ReadVarInt()
+    if length <= 0 {
+        return ""
     }
-    
-    decoder := NewPacketDecoder(data)
-    
-    packetID, err := decoder.ReadByte()
-    if err != nil {
-        return nil, err
-    }
-    
-    if packetID != IDLogin {
-        return nil, fmt.Errorf("not a login packet")
-    }
-    
-    packet := &LoginPacket{}
-    
-    // Protocol version
-    packet.ProtocolVersion, err = decoder.ReadInt32()
-    if err != nil {
-        return nil, err
-    }
-    
-    // Connection request data (length-prefixed)
-    requestDataLen, err := decoder.ReadUint32()
-    if err != nil {
-        return nil, err
-    }
-    
-    packet.ConnectionRequestData, err = decoder.ReadBytes(int(requestDataLen))
-    if err != nil {
-        return nil, err
-    }
-    
-    // Client network version
-    packet.ClientNetworkVersion, err = decoder.ReadInt32()
-    if err != nil {
-        return nil, err
-    }
-    
-    return packet, nil
+    data := d.stream.ReadBytes(int(length))
+    return string(data)
 }
 
-func DecodePlayStatusPacket(data []byte) (*PlayStatusPacket, error) {
-    if len(data) < 5 {
-        return nil, fmt.Errorf("packet too short")
+func (d *Decoder) ReadULong() uint64 {
+    data := d.stream.ReadBytes(8)
+    if len(data) < 8 {
+        return 0
     }
-    
-    decoder := NewPacketDecoder(data)
-    
-    packetID, err := decoder.ReadByte()
-    if err != nil {
-        return nil, err
+    return binary.BigEndian.Uint64(data)
+}
+
+func (d *Decoder) ReadLong() int64 {
+    return int64(d.ReadULong())
+}
+
+func (d *Decoder) ReadUInt32() uint32 {
+    data := d.stream.ReadBytes(4)
+    if len(data) < 4 {
+        return 0
     }
-    
-    if packetID != IDPlayStatus {
-        return nil, fmt.Errorf("not a play status packet")
+    return binary.BigEndian.Uint32(data)
+}
+
+func (d *Decoder) ReadInt32() int32 {
+    return int32(d.ReadUInt32())
+}
+
+func (d *Decoder) ReadShort() int16 {
+    data := d.stream.ReadBytes(2)
+    if len(data) < 2 {
+        return 0
     }
-    
-    packet := &PlayStatusPacket{}
-    packet.Status, err = decoder.ReadInt32()
-    if err != nil {
-        return nil, err
+    return int16(binary.BigEndian.Uint16(data))
+}
+
+func (d *Decoder) ReadUShort() uint16 {
+    data := d.stream.ReadBytes(2)
+    if len(data) < 2 {
+        return 0
     }
-    
-    return packet, nil
+    return binary.BigEndian.Uint16(data)
+}
+
+func (d *Decoder) ReadFloat32() float32 {
+    data := d.stream.ReadBytes(4)
+    if len(data) < 4 {
+        return 0
+    }
+    return math.Float32frombits(binary.BigEndian.Uint32(data))
+}
+
+func (d *Decoder) ReadFloat64() float64 {
+    data := d.stream.ReadBytes(8)
+    if len(data) < 8 {
+        return 0
+    }
+    return math.Float64frombits(binary.BigEndian.Uint64(data))
+}
+
+func (d *Decoder) ReadBool() bool {
+    return d.stream.ReadByte() == 1
+}
+
+func (d *Decoder) ReadByteArray() []byte {
+    length := d.ReadVarInt()
+    if length <= 0 {
+        return nil
+    }
+    return d.stream.ReadBytes(int(length))
+}
+
+func (d *Decoder) Remaining() int {
+    return len(d.stream.Bytes()) - d.stream.Offset
 }
