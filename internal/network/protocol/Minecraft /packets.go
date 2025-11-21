@@ -39,4 +39,4 @@ func setupSignalHandling(server *raknet.RakNetServer) {
         server.Stop()
         os.Exit(0)
     }()
-}
+}   

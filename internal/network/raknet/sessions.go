@@ -1,67 +1,10 @@
 package raknet
 
 import (
-    "sync"
     "time"
 )
 
-type Session struct {
-    address        *net.UDPAddr
-    mtuSize        int
-    guid           int64
-    state          SessionState
-    lastActivity   time.Time
-    server         *RakNetServer
-    reliableManager *ReliableManager
-    mutex          sync.RWMutex
-    
-    // Game session data
-    playerName     string
-    playerID       int64
-}
-
-func (s *RakNetServer) createSession(addr *net.UDPAddr) *Session {
-    session := &Session{
-        address:      addr,
-        mtuSize:      minMTUSize,
-        state:        StateUnconnected,
-        lastActivity: time.Now(),
-        server:       s,
-    }
-    
-    session.reliableManager = NewReliableManager(session)
-    return session
-}
-
-func (s *Session) UpdateActivity() {
-    s.mutex.Lock()
-    s.lastActivity = time.Now()
-    s.mutex.Unlock()
-}
-
-func (s *Session) GetState() SessionState {
-    s.mutex.RLock()
-    defer s.mutex.RUnlock()
-    return s.state
-}
-
-func (s *Session) SetState(state SessionState) {
-    s.mutex.Lock()
-    s.state = state
-    s.mutex.Unlock()
-}
-
-func (s *Session) SendGamePacket(packetData []byte) error {
-    packet := &EncapsulatedPacket{
-        Reliability: ReliabilityReliable,
-        Data:        packetData,
-    }
-    
-    return s.reliableManager.SendPacket(packet, ReliabilityReliable)
-}
-
 func (s *Session) HandleGamePacket(packetData []byte) {
-    // Parse Minecraft packet
     if len(packetData) < 1 {
         return
     }
@@ -69,47 +12,231 @@ func (s *Session) HandleGamePacket(packetData []byte) {
     packetID := packetData[0]
     
     switch packetID {
-    case 0x01: // Login packet
-        s.handleLoginPacket(packetData)
-    case 0x02: // Play status packet
-        s.handlePlayStatusPacket(packetData)
-    case 0x03: // Server to client handshake
-        s.handleServerHandshakePacket(packetData)
-    case 0x04: // Client to server handshake
-        s.handleClientHandshakePacket(packetData)
+    case minecraft.IDLogin:
+        s.handleMinecraftLogin(packetData)
+    case minecraft.IDClientToServerHandshake:
+        s.handleClientHandshake(packetData)
+    case minecraft.IDResourcePackClientResponse:
+        s.handleResourcePackResponse(packetData)
+    case minecraft.IDMovePlayer:
+        s.handleMovePlayer(packetData)
+    case minecraft.IDPlayerAction:
+        s.handlePlayerAction(packetData)
     default:
-        log.Printf("Unknown game packet ID: 0x%02x", packetID)
+        log.Printf("Unhandled Minecraft packet ID: 0x%02x", packetID)
     }
 }
 
-func (s *Session) handleLoginPacket(data []byte) {
-    if len(data) < 3 {
+func (s *Session) handleMovePlayer(data []byte) {
+    movePacket, err := minecraft.DecodeMovePlayerPacket(data)
+    if err != nil {
+        log.Printf("Error decoding move player packet: %v", err)
         return
     }
     
-    // Parse login packet (simplified)
-    protocolVersion := binary.BigEndian.Uint32(data[1:5])
+    if movePacket.RuntimeID != uint64(s.entityID) {
+        log.Printf("Move packet for wrong entity: %d != %d", movePacket.RuntimeID, s.entityID)
+        return
+    }
     
-    log.Printf("Login request: protocol=%d from %s", protocolVersion, s.address)
-    
-    // Send play status packet (login success)
-    response := make([]byte, 3)
-    response[0] = 0x02 // Play status packet
-    binary.BigEndian.PutUint32(response[1:5], 0) // Success
-    
-    s.SendGamePacket(response)
-    
-    s.SetState(StateConnected)
+    // Validate movement with physics
+    if s.validateMovement(movePacket) {
+        // Update player position
+        s.playerEntity.Position = movePacket.Position
+        s.playerEntity.Rotation = movePacket.Rotation
+        
+        // Update chunk coordinates if needed
+        newChunkX := int32(movePacket.Position.X) >> 4
+        newChunkZ := int32(movePacket.Position.Z) >> 4
+        
+        if newChunkX != s.playerEntity.ChunkCoord.X || newChunkZ != s.playerEntity.ChunkCoord.Z {
+            s.playerEntity.ChunkCoord.X = newChunkX
+            s.playerEntity.ChunkCoord.Z = newChunkZ
+            s.world.sendChunksToPlayer(s.playerEntity)
+        }
+        
+        // Broadcast movement to other players (would implement later)
+        // s.broadcastMovement(movePacket)
+    } else {
+        // Send correction packet
+        s.sendPositionCorrection()
+    }
 }
 
-func (s *Session) handlePlayStatusPacket(data []byte) {
-    // Handle play status response
+func (s *Session) validateMovement(packet *minecraft.MovePlayerPacket) bool {
+    // Simple validation - check if player is trying to move through blocks
+    currentPos := s.playerEntity.Position
+    newPos := packet.Position
+    
+    // Calculate movement vector
+    movement := minecraft.Vector3{
+        X: newPos.X - currentPos.X,
+        Y: newPos.Y - currentPos.Y,
+        Z: newPos.Z - currentPos.Z,
+    }
+    
+    // Check for unreasonable movement speed (anti-cheat)
+    movementDistance := math.Sqrt(float64(movement.X*movement.X + movement.Y*movement.Y + movement.Z*movement.Z))
+    if movementDistance > 10.0 { // Max movement per packet
+        log.Printf("Suspicious movement distance: %.2f", movementDistance)
+        return false
+    }
+    
+    // Check collision
+    playerAABB := world.GetPlayerAABB(newPos)
+    if s.world.CheckCollision(playerAABB) {
+        log.Printf("Movement would cause collision")
+        return false
+    }
+    
+    return true
 }
 
-func (s *Session) handleServerHandshakePacket(data []byte) {
-    // Handle server handshake
+func (s *Session) sendPositionCorrection() {
+    correctionPacket := &minecraft.MovePlayerPacket{
+        RuntimeID: uint64(s.entityID),
+        Position:  s.playerEntity.Position,
+        Rotation:  s.playerEntity.Rotation,
+        Mode:      0, // Normal
+        OnGround:  true,
+        Tick:      uint64(time.Now().UnixNano() / int64(time.Millisecond)),
+    }
+    
+    packetData, err := minecraft.EncodeMovePlayerPacket(correctionPacket)
+    if err != nil {
+        log.Printf("Error encoding position correction: %v", err)
+        return
+    }
+    
+    s.SendGamePacket(packetData)
 }
 
-func (s *Session) handleClientHandshakePacket(data []byte) {
-    // Handle client handshake
+func (s *Session) handlePlayerAction(data []byte) {
+    actionPacket, err := minecraft.DecodePlayerActionPacket(data)
+    if err != nil {
+        log.Printf("Error decoding player action packet: %v", err)
+        return
+    }
+    
+    if actionPacket.RuntimeID != uint64(s.entityID) {
+        return
+    }
+    
+    switch actionPacket.Action {
+    case 0: // Start break
+        s.handleBlockBreakStart(actionPacket.Position, actionPacket.Face)
+    case 1: // Abort break
+        s.handleBlockBreakAbort(actionPacket.Position)
+    case 2: // Stop break
+        s.handleBlockBreakComplete(actionPacket.Position)
+    case 3: // Get updated block
+        // Handle block update
+    case 4: // Drop item
+        s.handleItemDrop()
+    case 5: // Start sleep
+        // Handle sleep
+    case 6: // Stop sleep
+        // Handle wake up
+    case 7: // Respawn
+        s.handleRespawn()
+    case 8: // Jump
+        // Handle jump
+    case 9: // Start sprint
+        s.handleSprintStart()
+    case 10: // Stop sprint
+        s.handleSprintStop()
+    case 11: // Start sneak
+        s.handleSneakStart()
+    case 12: // Stop sneak
+        s.handleSneakStop()
+    default:
+        log.Printf("Unknown player action: %d", actionPacket.Action)
+    }
+}
+
+func (s *Session) handleBlockBreakStart(pos minecraft.BlockPos, face int32) {
+    log.Printf("Player started breaking block at %d,%d,%d", pos.X, pos.Y, pos.Z)
+    
+    // Convert to world coordinates
+    chunkX := pos.X >> 4
+    chunkZ := pos.Z >> 4
+    localX := pos.X & 0xF
+    localZ := pos.Z & 0xF
+    
+    chunk := s.world.GetChunk(chunkX, chunkZ)
+    block := chunk.GetBlock(localX, pos.Y, localZ)
+    
+    if block.ID == 0 { // Air
+        return
+    }
+    
+    // Send block break animation to other players
+    // s.broadcastBlockBreakAnimation(pos, face)
+}
+
+func (s *Session) handleBlockBreakComplete(pos minecraft.BlockPos) {
+    log.Printf("Player completed breaking block at %d,%d,%d", pos.X, pos.Y, pos.Z)
+    
+    // Convert to world coordinates
+    chunkX := pos.X >> 4
+    chunkZ := pos.Z >> 4
+    localX := pos.X & 0xF
+    localZ := pos.Z & 0xF
+    
+    chunk := s.world.GetChunk(chunkX, chunkZ)
+    
+    // Set block to air
+    chunk.SetBlock(localX, pos.Y, localZ, world.Block{ID: 0, Data: 0})
+    
+    // Send block update to all players
+    s.broadcastBlockUpdate(pos, 0)
+}
+
+func (s *Session) broadcastBlockUpdate(pos minecraft.BlockPos, blockID uint32) {
+    updatePacket := &minecraft.UpdateBlockPacket{
+        Position: pos,
+        BlockID:  blockID,
+        Flags:    1, // Network
+        Layer:    0, // Normal layer
+    }
+    
+    packetData, err := minecraft.EncodeUpdateBlockPacket(updatePacket)
+    if err != nil {
+        log.Printf("Error encoding block update: %v", err)
+        return
+    }
+    
+    // Broadcast to all players in world (simplified - just send to self for now)
+    s.SendGamePacket(packetData)
+}
+
+func (s *Session) handleRespawn() {
+    log.Printf("Player respawning")
+    
+    // Reset player position
+    s.playerEntity.Position = minecraft.Vector3{X: 0, Y: 70, Z: 0}
+    s.playerEntity.Rotation = minecraft.Vector2{X: 0, Y: 0}
+    
+    // Send new position
+    s.sendPositionCorrection()
+}
+
+func (s *Session) handleSprintStart() {
+    log.Printf("Player started sprinting")
+}
+
+func (s *Session) handleSprintStop() {
+    log.Printf("Player stopped sprinting")
+}
+
+func (s *Session) handleSneakStart() {
+    log.Printf("Player started sneaking")
+}
+
+func (s *Session) handleSneakStop() {
+    log.Printf("Player stopped sneaking")
+}
+
+func (s *Session) handleItemDrop() {
+    log.Printf("Player dropped item")
 }
