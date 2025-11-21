@@ -1,0 +1,7 @@
+{
+  "address": "0.0.0.0",
+  "port": 19132,
+  "max_players": 50,
+  "motd": "🦅 Garuda Server",
+  "world_name": "garuda-world"
+}
