@@ -17,6 +17,7 @@ import (
     "github.com/anabex-dev/garuda/internal/server"
     "github.com/anabex-dev/garuda/internal/world"
     "github.com/anabex-dev/garuda/pkg/plugin"
+    "github.com/anabex-dev/garuda/api"
 )
 
 var (
@@ -30,6 +31,12 @@ var garudaServer *raknet.RakNetServer
 
 func main() {
     // Parse command line flags
+    
+     if err := apiServer.Start(8080); err != nil {
+        log.Printf("Failed to start API server: %v", err)
+    } else {
+        log.Printf("REST API available at http://localhost:8080")
+    }
     var (
         configFile    = flag.String("config", "config.json", "Configuration file path")
         versionFlag   = flag.Bool("version", false, "Show version information")
