@@ -4,7 +4,7 @@ import (
     "fmt"
     "garuda/internal/config"
     "garuda/internal/network/raknet"
-    "garuda/minecraft/server"
+    "garuda/internal/server"
     "garuda/pkg/utils"
     "log"
     "os"

@@ -3,10 +3,10 @@ package server
 import (
     "garuda/internal/config"
     "garuda/internal/network/raknet"
-    "garuda/minecraft"
+    "garuda/internal/protocol/minecraft"
     "garuda/pkg/plugin"
     "garuda/pkg/utils"
-    "garuda/world"
+    "garuda/internal/world"
     "math"
     "sync"
     "time"

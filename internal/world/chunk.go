@@ -301,4 +301,4 @@ func (c *Chunk) OptimizeMemory() {
             c.Sections[i] = nil // Free empty sections
         }
     }
-}
+}   

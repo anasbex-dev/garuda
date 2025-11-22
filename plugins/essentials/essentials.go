@@ -3,7 +3,7 @@ package essentials
 import (
     "fmt"
     "garuda/pkg/plugin"
-    "garuda/world"
+    "garuda/internal/world"
     "strconv"
 )
 

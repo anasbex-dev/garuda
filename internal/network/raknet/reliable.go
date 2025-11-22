@@ -1,7 +1,7 @@
 package raknet
 
 import (
-    "garuda/minecraft"
+    "garuda/internal/protocol/minecraft"
     "garuda/pkg/utils"
 )
 

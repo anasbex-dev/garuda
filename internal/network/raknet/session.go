@@ -2,7 +2,7 @@ package raknet
 
 import (
     "encoding/binary"
-    "garuda/minecraft"
+    "garuda/internal/protocol/minecraft"
     "garuda/pkg/utils"
     "net"
     "time"
@@ -20,9 +20,12 @@ type Session struct {
     player        *server.Player
     compression   bool
     encryption    bool
+    crypto      *utils.CryptoHandler
+    encrypted   bool
 }
 
 func NewSession(addr *net.UDPAddr, server *Server, logger *utils.Logger) *Session {
+    crypto, _ := utils.NewCryptoHandler()
     session := &Session{
         addr:         addr,
         server:       server,
@@ -31,10 +34,35 @@ func NewSession(addr *net.UDPAddr, server *Server, logger *utils.Logger) *Sessio
         lastActivity: time.Now(),
         packetChan:   make(chan []byte, 100),
         closeChan:    make(chan bool, 1),
+        crypto:      crypto,
+        encrypted:   false,
     }
     
     go session.handleMinecraftPackets()
     return session
+}
+
+func (s *Session) GetPublicKey() []byte {
+    if s.crypto != nil {
+        return s.crypto.GetPublicKey()
+    }
+    return nil
+}
+
+// Method untuk enable encryption
+func (s *Session) EnableEncryption(sharedSecret []byte) error {
+    if s.crypto == nil {
+        return fmt.Errorf("crypto handler not initialized")
+    }
+    
+    err := s.crypto.SetupEncryption(sharedSecret)
+    if err != nil {
+        return err
+    }
+    
+    s.encrypted = true
+    s.logger.Debug("Encryption enabled for session %s", s.addr.String())
+    return nil
 }
 
 func (s *Session) processMinecraftPacket(data []byte) {

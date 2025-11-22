@@ -1,8 +1,8 @@
 package plugin
 
 import (
-    "garuda/minecraft"
-    "garuda/world"
+    "garuda/internal/protocol/minecraft"
+    "garuda/internal/world"
 )
 
 type Plugin interface {

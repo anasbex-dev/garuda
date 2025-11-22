@@ -1,120 +1,59 @@
 package minecraft
 
 import (
-    "encoding/binary"
-    "garuda/pkg/utils"
-    "math"
+	"encoding/binary"
+	"errors"
+	"garuda/pkg/utils"
 )
 
-type Decoder struct {
-    stream *utils.BinaryStream
+const (
+	MAX_PACKET_SIZE = 1024 * 1024 // 1MB
+)
+
+type PacketDecoder struct {
+	compressionEnabled bool
+	compressionThreshold int
 }
 
-func NewDecoder(data []byte) *Decoder {
-    return &Decoder{
-        stream: utils.NewBinaryStream(data),
-    }
+func NewPacketDecoder() *PacketDecoder {
+	return &PacketDecoder{
+		compressionEnabled: false,
+		compressionThreshold: 512,
+	}
 }
 
-func (d *Decoder) ReadVarInt() int32 {
-    var value int32
-    var position int
-    var currentByte byte
+func (d *PacketDecoder) DecodePacket(data []byte) ([]byte, error) {
+	if len(data) < 1 {
+		return nil, errors.New("empty packet data")
+	}
 
-    for {
-        currentByte = d.stream.ReadByte()
-        value |= int32(currentByte&0x7F) << position
+	// Minecraft Bedrock uses length-prefixed packets
+	offset := 0
+	length, bytesRead := binary.Uvarint(data[offset:])
+	if bytesRead <= 0 {
+		return nil, errors.New("invalid packet length")
+	}
+	offset += bytesRead
 
-        if (currentByte & 0x80) == 0 {
-            break
-        }
+	if length > MAX_PACKET_SIZE {
+		return nil, errors.New("packet too large")
+	}
 
-        position += 7
-        if position >= 32 {
-            return 0 // Error
-        }
-    }
+	if int(length) > len(data)-offset {
+		return nil, errors.New("incomplete packet")
+	}
 
-    return value
+	packetData := data[offset : offset+int(length)]
+	return packetData, nil
 }
 
-func (d *Decoder) ReadString() string {
-    length := d.ReadVarInt()
-    if length <= 0 {
-        return ""
-    }
-    data := d.stream.ReadBytes(int(length))
-    return string(data)
-}
-
-func (d *Decoder) ReadULong() uint64 {
-    data := d.stream.ReadBytes(8)
-    if len(data) < 8 {
-        return 0
-    }
-    return binary.BigEndian.Uint64(data)
-}
-
-func (d *Decoder) ReadLong() int64 {
-    return int64(d.ReadULong())
-}
-
-func (d *Decoder) ReadUInt32() uint32 {
-    data := d.stream.ReadBytes(4)
-    if len(data) < 4 {
-        return 0
-    }
-    return binary.BigEndian.Uint32(data)
-}
-
-func (d *Decoder) ReadInt32() int32 {
-    return int32(d.ReadUInt32())
-}
-
-func (d *Decoder) ReadShort() int16 {
-    data := d.stream.ReadBytes(2)
-    if len(data) < 2 {
-        return 0
-    }
-    return int16(binary.BigEndian.Uint16(data))
-}
-
-func (d *Decoder) ReadUShort() uint16 {
-    data := d.stream.ReadBytes(2)
-    if len(data) < 2 {
-        return 0
-    }
-    return binary.BigEndian.Uint16(data)
-}
-
-func (d *Decoder) ReadFloat32() float32 {
-    data := d.stream.ReadBytes(4)
-    if len(data) < 4 {
-        return 0
-    }
-    return math.Float32frombits(binary.BigEndian.Uint32(data))
-}
-
-func (d *Decoder) ReadFloat64() float64 {
-    data := d.stream.ReadBytes(8)
-    if len(data) < 8 {
-        return 0
-    }
-    return math.Float64frombits(binary.BigEndian.Uint64(data))
-}
-
-func (d *Decoder) ReadBool() bool {
-    return d.stream.ReadByte() == 1
-}
-
-func (d *Decoder) ReadByteArray() []byte {
-    length := d.ReadVarInt()
-    if length <= 0 {
-        return nil
-    }
-    return d.stream.ReadBytes(int(length))
-}
-
-func (d *Decoder) Remaining() int {
-    return len(d.stream.Bytes()) - d.stream.Offset
+func (d *PacketDecoder) EncodePacket(data []byte) ([]byte, error) {
+	lengthBuf := make([]byte, binary.MaxVarintLen32)
+	bytesWritten := binary.PutUvarint(lengthBuf, uint64(len(data)))
+	
+	result := make([]byte, bytesWritten+len(data))
+	copy(result, lengthBuf[:bytesWritten])
+	copy(result[bytesWritten:], data)
+	
+	return result, nil
 }

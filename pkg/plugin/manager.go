@@ -1,9 +1,9 @@
 package plugin
 
 import (
-    "garuda/minecraft/server"
+    "garuda/internal/server"
     "garuda/pkg/utils"
-    "garuda/world"
+    "garuda/internal/world"
     "sync"
 )
 
