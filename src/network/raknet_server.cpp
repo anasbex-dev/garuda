@@ -7,6 +7,8 @@
 #include <cstring>
 #include <algorithm>
 #include <chrono>
+#include <iomanip>
+#include <sstream>
 
 // ==================== IMPROVED RAKNET HEADER HANDLING ====================
 
@@ -56,7 +58,25 @@ struct RakNetHeader {
     }
 };
 
+// ==================== IMPLEMENTASI FUNCTION YANG MISSING ====================
+
+void RakNetServer::logHex(const uint8_t* data, size_t length, const std::string& description) {
+    if (!description.empty()) {
+        std::cout << description << " (" << length << " bytes): ";
+    }
+    
+    for (size_t i = 0; i < length; ++i) {
+        std::cout << std::hex << std::setw(2) << std::setfill('0') 
+                  << static_cast<int>(data[i]) << " ";
+    }
+    std::cout << std::dec << std::endl;
+}
+
 // ==================== IMPROVED CONNECTION MANAGEMENT ====================
+
+RakNetServer::RakNetServer() : socket_(-1), running_(false) {
+    // Initialize encryption handler
+}
 
 void RakNetServer::startConnectionTimer(Connection& conn) {
     conn.last_activity = std::chrono::steady_clock::now();
@@ -112,7 +132,7 @@ void RakNetServer::sendReliablePacket(Connection& conn, const std::vector<uint8_
     auto packet = addRakNetHeader(payload, sequence, 0x04); // Reliable unordered
     
     // Store in sent queue for potential resend
-    SentPacket sent_packet;
+    Connection::SentPacket sent_packet;
     sent_packet.data = packet;
     sent_packet.timestamp = std::chrono::steady_clock::now();
     sent_packet.sequence = sequence;
@@ -142,140 +162,209 @@ void RakNetServer::sendRawPacket(const Connection& conn, const std::vector<uint8
 
 void RakNetServer::handleIncomingPackets() {
     if (!running_) return;
-    
-    sockaddr_in client_addr;
+
+    sockaddr_in client_addr{};
     socklen_t addr_len = sizeof(client_addr);
     uint8_t buffer[4096];
-    
-    ssize_t received = recvfrom(socket_, buffer, sizeof(buffer), MSG_DONTWAIT,
-                               (sockaddr*)&client_addr, &addr_len);
-    
-    if (received > 0) {
-        uint8_t packet_id = buffer[0];
-        
-        std::cout << "Received packet: 0x" << std::hex << (int)packet_id 
-                  << " from " << inet_ntoa(client_addr.sin_addr) 
-                  << ":" << ntohs(client_addr.sin_port) 
-                  << " (" << received << " bytes)" << std::dec << std::endl;
-        
-        logHex(buffer, std::min(received, ssize_t(16)), "Data: ");
-        
-        // Update connection activity
-        auto conn = findOrCreateConnection(client_addr);
-        startConnectionTimer(*conn);
-        
-        // Handle packet types
-  switch (packet_id) {
-    case 0x01: // UNCONNECTED_PING
-        handleUnconnectedPing(client_addr, buffer, received);
-        break;
-    case 0x05: // OPEN_CONNECTION_REQUEST_1
-        handleOpenConnectionRequest1(client_addr, buffer, received);
-        break;
-    case 0x07: // OPEN_CONNECTION_REQUEST_2
-        handleOpenConnectionRequest2(client_addr, buffer, received);
-        break;
-    case 0x09: // CONNECTION_REQUEST
-        handleConnectionRequest(client_addr, buffer, received);
-        break;
-    case 0x13: // NEW_INCOMING_CONNECTION
-        handleNewIncomingConnection(client_addr, buffer, received);
-        break;
-    case 0x15: // DISCONNECTION_NOTIFICATION
-        handleDisconnection(client_addr, buffer, received);
-        break;
-    case 0x84: // CONNECTED_PING - FIX: ADD THIS
-        handleConnectedPing(client_addr, buffer, received);
-        break;
-    case 0x90: // CLIENT_CONNECT (Bedrock)
-        std::cout << "=== CLIENT_CONNECT RECEIVED ===" << std::endl;
-        handleClientConnect(client_addr, buffer, received);
-        break;
-    case 0xc0: // ACK
-        handleAckPacket(client_addr, buffer, received);
-        break;
-    case 0xa0: // NACK
-        handleNackPacket(client_addr, buffer, received);
-        break;
-    default: 
-        // Handle as connected packet if it has RakNet header
-        if (packet_id & 0x80) {
-            handleConnectedPacket(client_addr, buffer, received);
-        } else {
-            std::cout << "Unknown packet: 0x" << std::hex << (int)packet_id << std::dec << std::endl;
-        }
-        break;
-        }
+
+    // Non-blocking receive
+    ssize_t received = recvfrom(
+        socket_,
+        buffer,
+        sizeof(buffer),
+        MSG_DONTWAIT,
+        (sockaddr*)&client_addr,
+        &addr_len
+    );
+
+    if (received <= 0) {
+        return;
     }
-    
-    // Handle packet resends and cleanup
+
+    uint8_t packet_id = buffer[0];
+
+    std::cout << "Received packet: 0x" << std::hex << (int)packet_id
+              << " from " << inet_ntoa(client_addr.sin_addr)
+              << ":" << ntohs(client_addr.sin_port)
+              << " (" << std::dec << received << " bytes)\n";
+
+    logHex(buffer, std::min(received, ssize_t(16)), "Data: ");
+
+    // Track / create connection
+    auto conn = findOrCreateConnection(client_addr);
+    startConnectionTimer(*conn);
+
+    // -------------------------
+    //   UNCONNECTED RAKNET
+    // -------------------------
+    switch (packet_id) {
+        case 0x01: // UNCONNECTED_PING
+            handleUnconnectedPing(client_addr, buffer, received);
+            return;
+
+        case 0x05: // OPEN_CONNECTION_REQUEST_1
+            handleOpenConnectionRequest1(client_addr, buffer, received);
+            return;
+
+        case 0x07: // OPEN_CONNECTION_REQUEST_2
+            handleOpenConnectionRequest2(client_addr, buffer, received);
+            return;
+
+        case 0x09: // CONNECTION_REQUEST
+            handleConnectionRequest(client_addr, buffer, received);
+            return;
+
+        case 0x13: // NEW_INCOMING_CONNECTION
+            handleNewIncomingConnection(client_addr, buffer, received);
+            return;
+
+        case 0x15: // DISCONNECTION_NOTIFICATION
+            handleDisconnection(client_addr, buffer, received);
+            return;
+
+        case 0xC0: // ACK
+            handleAckPacket(client_addr, buffer, received);
+            return;
+
+        case 0xA0: // NACK
+            handleNackPacket(client_addr, buffer, received);
+            return;
+
+        case 0x84: // CONNECTED_PING (RakNet connected layer)
+            handleConnectedPing(client_addr, buffer, received);
+            return;
+
+        case 0x90: // CLIENT_CONNECT (BEDROCK PACKET, NOT RAKNET)
+            std::cout << "=== CLIENT_CONNECT PACKET ===\n";
+            handleClientConnect(client_addr, buffer, received);
+            return;
+    }
+
+    // -------------------------
+    //    CONNECTED PACKETS
+    // -------------------------
+    // Bit 7 harus 1 => paket RakNet yang sudah "connected" (0b1xxxxxxx)
+    if (packet_id & 0x80) {
+        handleConnectedPacket(client_addr, buffer, received);
+        return;
+    }
+
+    // -------------------------
+    //       UNKNOWN
+    // -------------------------
+    std::cout << "Unknown RakNet/Bedrock packet: 0x" 
+              << std::hex << (int)packet_id << std::dec << "\n";
+
     handleResends();
     cleanupStaleConnections();
 }
 
 void RakNetServer::handleConnectedPacket(sockaddr_in client_addr, uint8_t* buffer, size_t length) {
-    // Skip jika ini CONNECTED_PING (0x84) - sudah dihandle di switch case
-    if (buffer[0] == 0x00 || buffer[0] == 0x03 || buffer[0] == 0x84) {
-        return; // Ini special packets, bukan Bedrock packets
+    // Jika ini CONNECTED_PING (0x84) atau CONNECTED_PONG (0x85), pindah ke handler khusus
+    if (buffer[0] == 0x84) {
+        handleConnectedPing(client_addr, buffer, length);
+        return;
     }
-    
-    auto header = RakNetHeader::parse(buffer, length);
+    if (buffer[0] == 0x85) {
+        handleConnectedPong(client_addr, buffer, length);
+        return;
+    }
+
     auto conn = findOrCreateConnection(client_addr);
-    
-    std::cout << "Connected packet - Flags: 0x" << std::hex << (int)header.flags 
-              << " Seq: " << std::dec << header.sequence << std::endl;
-    
-    // Always ACK the sequence number
+    RakNetHeader header = RakNetHeader::parse(buffer, length);
+
+    std::cout << "[Connected] Flags=0x" << std::hex << (int)header.flags
+              << " Seq=" << std::dec << header.sequence << std::endl;
+
+    // Wajib ACK setiap sequence client
     sendAckPacket(client_addr, header.sequence);
-    
-    // Extract payload (skip RakNet header)
-    size_t header_size = 3; // Minimum header size
-    
-    // Advanced header parsing untuk reliability flags
+
+    //
+    // --- Reliability Parsing ---
+    //
     uint8_t reliability = (header.flags >> 5) & 0x07;
+    size_t offset = 3; // minimal header size
+
+    // Jika reliable → add reliableIndex (2 bytes) + messageIndex (1 byte)
     if (reliability == 2 || reliability == 3 || reliability == 4 || reliability == 6 || reliability == 7) {
-        header_size += 3; // Reliable index
+        offset += 3;
     }
+
+    // Jika ordered/sequenced → add ordering channel info
     if (reliability == 1 || reliability == 3 || reliability == 4) {
-        header_size += 4; // Ordering info
+        offset += 4;
     }
-    
-    if (length > header_size) {
-        uint8_t* payload = buffer + header_size;
-        size_t payload_len = length - header_size;
-        
-        if (payload_len > 0) {
-            uint8_t bedrock_packet_id = payload[0];
-            std::cout << "Bedrock packet ID: 0x" << std::hex << (int)bedrock_packet_id << std::dec << std::endl;
-            
-            // Handle specific Bedrock packets
-            switch (bedrock_packet_id) {
-                case 0x01: // Login packet
-                    handleBedrockLogin(*conn, payload, payload_len);
-                    break;
-                case 0x90: // CLIENT_CONNECT
-                    std::cout << "CLIENT_CONNECT in connected packet" << std::endl;
-                    handleClientConnect(client_addr, payload, payload_len);
-                    break;
-                    case 0x84: // CONNECTED_PING
-                    handleConnectedPing(client_addr, payload, payload_len);
-                    break;
-                default:
-                    std::cout << "Unknown Bedrock packet: 0x" << std::hex << (int)bedrock_packet_id << std::dec << std::endl;
-                    // Log full payload untuk debugging
-                    logHex(payload, std::min(payload_len, size_t(16)), "Payload: ");
-                    break;
-            }
-        }
+
+    if (offset >= length) return;
+
+    uint8_t* payload = buffer + offset;
+    size_t payload_len = length - offset;
+
+    if (payload_len == 0) return;
+
+    uint8_t pk = payload[0];
+
+    std::cout << "[Bedrock] Packet ID: 0x" << std::hex << (int)pk << std::dec << std::endl;
+
+    switch (pk) {
+        case 0x01: // LOGIN
+            handleBedrockLogin(*conn, payload, payload_len);
+            break;
+
+        case 0x90: // CLIENT_CONNECT
+            std::cout << "[Bedrock] CLIENT_CONNECT" << std::endl;
+            handleClientConnect(client_addr, payload, payload_len);
+            break;
+
+        default:
+            std::cout << "[Bedrock] Unknown: 0x" << std::hex << (int)pk << std::dec << std::endl;
+            logHex(payload, std::min(payload_len, (size_t)16), "Payload: ");
+            break;
     }
 }
 
-
 void RakNetServer::handleBedrockLogin(Connection& conn, uint8_t* buffer, size_t length) {
-    std::cout << "=== HANDLING BEDROCK LOGIN ===" << std::endl;
+    std::cout << "=== HANDLING BEDROCK LOGIN 1.21.50 ===" << std::endl;
     
-    // Send login sequence with proper reliability
-    sendLoginSequence(conn);
+    // Parse login packet header
+    if (length < 50) {
+        std::cout << "Login packet too short" << std::endl;
+        return;
+    }
+    
+    // Minecraft 1.21.50 login packet structure:
+    // - Protocol version (4 bytes)
+    // - Login data length (varint) 
+    // - Login data (chain of NBT data dengan JWT token, identity data, etc.)
+    
+    // Untuk testing, kita extract username sederhana
+    // Di real implementation, perlu parse NBT data
+    
+    // Cari username pattern dalam login data
+    std::string username = "Player";
+    for (size_t i = 10; i < length - 5; i++) {
+        if (buffer[i] == 'p' && buffer[i+1] == 'l' && buffer[i+2] == 't' && buffer[i+3] == 'N') {
+            // Potentially found platform data, extract username
+            if (i + 20 < length) {
+                username = "User_" + std::to_string(conn.guid);
+                break;
+            }
+        }
+    }
+    
+    conn.username = username;
+    
+    std::cout << "Player logging in: " << username << std::endl;
+    std::cout << "Login data size: " << length << " bytes" << std::endl;
+    
+    // Untuk Minecraft 1.21.50, kita perlu encryption handshake dulu
+    if (!conn.encrypted) {
+        std::cout << "Client not encrypted, initiating handshake..." << std::endl;
+        sendEncryptionRequest(conn);
+    } else {
+        std::cout << "Client already encrypted, continuing login..." << std::endl;
+        sendLoginSuccess(conn);
+    }
 }
 
 void RakNetServer::sendLoginSequence(Connection& conn) {
@@ -294,6 +383,117 @@ void RakNetServer::sendLoginSequence(Connection& conn) {
     sendReliablePacket(conn, start_game);
     
     std::cout << "Login sequence sent (waiting for ACKs)..." << std::endl;
+}
+
+// ==================== MODERN MINECRAFT AUTHENTICATION ====================
+
+void RakNetServer::sendLoginSuccess(Connection& conn) {
+    std::cout << "Sending LOGIN_SUCCESS after encryption handshake..." << std::endl;
+    
+    // Create PlayStatus packet dengan LOGIN_SUCCESS
+    std::vector<uint8_t> play_status;
+    play_status.push_back(0x02); // PlayStatus packet ID
+    
+    // Status: LOGIN_SUCCESS (0)
+    play_status.push_back(0x00);
+    play_status.push_back(0x00);
+    play_status.push_back(0x00);
+    play_status.push_back(0x00);
+    
+    sendReliablePacket(conn, play_status);
+    std::cout << "Sent LOGIN_SUCCESS, continuing login sequence..." << std::endl;
+    
+    // Lanjutkan dengan login sequence normal
+    sendLoginSequence(conn);
+}
+
+void RakNetServer::handleModernLogin(Connection& conn, uint8_t* buffer, size_t length) {
+    std::cout << "=== MODERN LOGIN HANDLER ===" << std::endl;
+    
+    // Parse modern login packet (contains JWT, identity data, etc.)
+    // For now, we'll use simplified authentication
+    conn.authenticated = true;
+    
+    // Send encryption request if needed
+    if (!conn.encrypted) {
+        sendEncryptionRequest(conn);
+    } else {
+        completeModernLogin(conn);
+    }
+}
+
+void RakNetServer::handleEncryptionHandshake(Connection& conn, uint8_t* buffer, size_t length) {
+    std::cout << "=== HANDLING CLIENT ENCRYPTION HANDSHAKE ===" << std::endl;
+    
+    if (length < 2) {
+        std::cout << "Invalid handshake packet length" << std::endl;
+        return;
+    }
+    
+    // Parse the handshake response
+    // Client mengirim ClientToServerHandshake (0x04) dengan encrypted payload
+    
+    logHex(buffer, std::min(length, (size_t)32), "Handshake response: ");
+    
+    // TRUE/FALSE
+    conn.encrypted = true;
+    
+    std::cout << "Encryption handshake SUCCESS for " << conn.address << std::endl;
+    
+    sendLoginSuccess(conn);
+}
+
+void RakNetServer::sendEncryptionRequest(Connection& conn) {
+    std::cout << "Sending encryption request to " << conn.address << ":" << conn.port << std::endl;
+    
+    // ===== TEST 1: Empty Handshake =====
+    std::vector<uint8_t> handshake_packet;
+    handshake_packet.push_back(0x03); // Packet ID ServerToClientHandshake
+    
+    handshake_packet.push_back(0x00); // Zero-length token
+    
+    std::cout << "TEST 1: Sending EMPTY handshake" << std::endl;
+    sendReliablePacket(conn, handshake_packet);
+    logHex(handshake_packet.data(), handshake_packet.size(), "Empty handshake: ");
+    
+    usleep(100000);
+    
+    // ===== TEST 2: Simple Token =====
+    handshake_packet.clear();
+    handshake_packet.push_back(0x03);
+    
+    std::string simple_token = "test";
+    handshake_packet.push_back(simple_token.length()); // Length
+    handshake_packet.insert(handshake_packet.end(), simple_token.begin(), simple_token.end());
+    
+    std::cout << "TEST 2: Sending SIMPLE handshake" << std::endl;
+    sendReliablePacket(conn, handshake_packet);
+    logHex(handshake_packet.data(), handshake_packet.size(), "Simple handshake: ");
+    
+    // ===== TEST 3: Use EncryptionHandler =====
+    handshake_packet.clear();
+    handshake_packet.push_back(0x03);
+    
+    auto handshake_data = encryption_handler_.generateHandshakeToken();
+    handshake_packet.push_back(handshake_data.size()); // Length
+    handshake_packet.insert(handshake_packet.end(), handshake_data.begin(), handshake_data.end());
+    
+    std::cout << "TEST 3: Sending ENCRYPTION HANDLER handshake" << std::endl;
+    sendReliablePacket(conn, handshake_packet);
+    logHex(handshake_packet.data(), handshake_packet.size(), "Encryption handler handshake: ");
+    
+    std::cout << "Sent 3 different handshake formats, waiting for response..." << std::endl;
+}
+
+
+void RakNetServer::completeModernLogin(Connection& conn) {
+    std::cout << "Completing modern login for " << conn.username << std::endl;
+    
+    // Mark as authenticated and send game data
+    conn.authenticated = true;
+    
+    // Send the normal login sequence
+    sendLoginSequence(conn);
 }
 
 // ==================== IMPROVED ACK/NACK HANDLING ====================
@@ -372,6 +572,11 @@ void RakNetServer::handleNewIncomingConnection(sockaddr_in client_addr, uint8_t*
     conn->sequence_out = 1;
     
     std::cout << "Client fully connected: " << conn->address << ":" << conn->port << std::endl;
+    
+    if (!conn->encrypted) {
+        std::cout << "=== INITIATING ENCRYPTION HANDSHAKE (BACKUP) ===" << std::endl;
+        sendEncryptionRequest(*conn);
+    }
 }
 
 void RakNetServer::handleDisconnection(sockaddr_in client_addr, uint8_t* buffer, size_t length) {
@@ -392,41 +597,79 @@ void RakNetServer::handleDisconnection(sockaddr_in client_addr, uint8_t* buffer,
 
 // ==================== IMPROVED PING/PONG ====================
 
-void RakNetServer::handleConnectedPing(sockaddr_in client_addr, uint8_t* buffer, size_t length) {
-    std::cout << "=== HANDLING CONNECTED_PING (0x84) ===" << std::endl;
-    
-    if (length < 5) return;
-    
-    // Extract ping time (4 bytes little endian) - dimulai dari offset 1
-    uint32_t ping_time = 0;
-    memcpy(&ping_time, &buffer[1], 4);
-    
-    std::cout << "Ping time: " << ping_time << std::endl;
-    
-    // Send CONNECTED_PONG response (0x85)
-    std::vector<uint8_t> response;
-    response.push_back(0x85); // CONNECTED_PONG packet ID
-    
-    // Ping time (copy from request)
-    for (int i = 0; i < 4; i++) {
-        response.push_back((ping_time >> (i * 8)) & 0xFF);
+/*void RakNetServer::handleConnectedPacket(sockaddr_in client_addr, uint8_t* buffer, size_t length) {
+    // Jika ini CONNECTED_PING (0x84) atau CONNECTED_PONG (0x85), pindah ke handler khusus
+    if (buffer[0] == 0x84) {
+        handleConnectedPing(client_addr, buffer, length);
+        return;
     }
-    
-    // Pong time (same as ping time for now)
-    for (int i = 0; i < 4; i++) {
-        response.push_back((ping_time >> (i * 8)) & 0xFF);
+    if (buffer[0] == 0x85) {
+        handleConnectedPong(client_addr, buffer, length);
+        return;
     }
-    
-    sendto(socket_, response.data(), response.size(), 0,
-           (sockaddr*)&client_addr, sizeof(client_addr));
-    
-    std::cout << "Sent CONNECTED_PONG (0x85) response" << std::endl;
-    logHex(response.data(), response.size(), "PONG: ");
-}
 
-void RakNetServer::handleConnectedPong(sockaddr_in client_addr, uint8_t* buffer, size_t length) {
-    std::cout << "Received CONNECTED_PONG" << std::endl;
-}
+    auto conn = findOrCreateConnection(client_addr);
+    RakNetHeader header = RakNetHeader::parse(buffer, length);
+
+    std::cout << "[Connected] Flags=0x" << std::hex << (int)header.flags
+              << " Seq=" << std::dec << header.sequence << std::endl;
+
+    // Wajib ACK setiap sequence client
+    sendAckPacket(client_addr, header.sequence);
+
+    //
+    // --- Reliability Parsing ---
+    //
+    uint8_t reliability = (header.flags >> 5) & 0x07;
+    size_t offset = 3; // minimal header size
+
+    // Jika reliable → add reliableIndex (2 bytes) + messageIndex (1 byte)
+    if (reliability == 2 || reliability == 3 || reliability == 4 || reliability == 6 || reliability == 7) {
+        offset += 3;
+    }
+
+    // Jika ordered/sequenced → add ordering channel info
+    if (reliability == 1 || reliability == 3 || reliability == 4) {
+        offset += 4;
+    }
+
+    if (offset >= length) return;
+
+    uint8_t* payload = buffer + offset;
+    size_t payload_len = length - offset;
+
+    if (payload_len == 0) return;
+
+    uint8_t pk = payload[0];
+
+    std::cout << "[Bedrock] Packet ID: 0x" << std::hex << (int)pk << std::dec << std::endl;
+
+    switch (pk) {
+        case 0x01: // LOGIN
+            handleBedrockLogin(*conn, payload, payload_len);
+            break;
+
+        case 0x03: // CLIENT_TO_SERVER_HANDSHAKE  // ========== TAMBAHKAN INI ==========
+            std::cout << "[Bedrock] CLIENT_TO_SERVER_HANDSHAKE" << std::endl;
+            handleEncryptionHandshake(*conn, payload, payload_len);
+            break;
+
+        case 0x04: // SERVER_TO_CLIENT_HANDSHAKE  // ========== TAMBAHKAN INI ==========
+            std::cout << "[Bedrock] SERVER_TO_CLIENT_HANDSHAKE RESPONSE" << std::endl;
+            handleEncryptionHandshake(*conn, payload, payload_len);
+            break;
+
+        case 0x90: // CLIENT_CONNECT
+            std::cout << "[Bedrock] CLIENT_CONNECT" << std::endl;
+            handleClientConnect(client_addr, payload, payload_len);
+            break;
+
+        default:
+            std::cout << "[Bedrock] Unknown: 0x" << std::hex << (int)pk << std::dec << std::endl;
+            logHex(payload, std::min(payload_len, (size_t)16), "Payload: ");
+            break;
+    }
+}*/
 
 // ==================== IMPROVED PACKET CREATION ====================
 
@@ -502,15 +745,6 @@ std::vector<uint8_t> RakNetServer::createStartGamePacket() {
 
 // ==================== EXISTING FUNCTIONS (MAINTAINED) ====================
 
-void logHex(const uint8_t* data, size_t length, const std::string& prefix = "") {
-    std::cout << prefix;
-    for (size_t i = 0; i < std::min(length, size_t(32)); i++) {
-        printf("%02X ", data[i]);
-    }
-    if (length > 32) std::cout << "...";
-    std::cout << std::endl;
-}
-
 bool RakNetServer::start(uint16_t port) {
     socket_ = socket(AF_INET, SOCK_DGRAM, 0);
     if (socket_ < 0) {
@@ -566,7 +800,7 @@ void RakNetServer::handleUnconnectedPing(sockaddr_in client_addr, uint8_t* buffe
     std::string server_info =
     "MCPE;"
     "GarudaMC Server;" // Server name 
-    "666;" // Protocol version (1.21.50)
+    "757;" // Protocol version (1.21.50)
     "1.21.50;" // Game version
     "0;"  // Player count  
     "250;" // Max players
@@ -648,8 +882,11 @@ void RakNetServer::handleOpenConnectionRequest2(sockaddr_in client_addr, uint8_t
     auto conn = findOrCreateConnection(client_addr);
     conn->connected = true;
     
-    std::cout << "=== CONNECTION HANDshake COMPLETED ===" << std::endl;
-    std::cout << "Waiting for CLIENT_CONNECT (0x90) from client..." << std::endl;
+    std::cout << "=== CONNECTION HANDSHAKE COMPLETED ===" << std::endl;
+    
+    std::cout << "=== INITIATING ENCRYPTION HANDSHAKE ===" << std::endl;
+    sendEncryptionRequest(*conn);
+    std::cout << "Waiting for client handshake response..." << std::endl;
 }
 
 void RakNetServer::sendAckPacket(sockaddr_in client_addr, uint16_t sequence_number) {
@@ -796,10 +1033,46 @@ void RakNetServer::stop() {
 }
 
 void RakNetServer::sendPacket(const Connection& conn, const std::vector<uint8_t>& data) {
-    // Remove the const_cast line and use reliable sending directly
-    // const_cast<Connection&>(conn);
-    
     // Use non-const reference for reliable packet sending
     Connection& nonConstConn = const_cast<Connection&>(conn);
     sendReliablePacket(nonConstConn, data);
+}
+
+// ==================== IMPROVED PING/PONG ====================
+
+void RakNetServer::handleConnectedPing(sockaddr_in client_addr, uint8_t* buffer, size_t length) {
+    std::cout << "=== HANDLING CONNECTED_PING (0x84) ===" << std::endl;
+    
+    if (length < 5) return;
+    
+    // Extract ping time (4 bytes little endian) - dimulai dari offset 1
+    uint32_t ping_time = 0;
+    memcpy(&ping_time, &buffer[1], 4);
+    
+    std::cout << "Ping time: " << ping_time << std::endl;
+    
+    // Send CONNECTED_PONG response (0x85)
+    std::vector<uint8_t> response;
+    response.push_back(0x85); // CONNECTED_PONG packet ID
+    
+    // Ping time (copy from request)
+    for (int i = 0; i < 4; i++) {
+        response.push_back((ping_time >> (i * 8)) & 0xFF);
+    }
+    
+    // Pong time (same as ping time for now)
+    for (int i = 0; i < 4; i++) {
+        response.push_back((ping_time >> (i * 8)) & 0xFF);
+    }
+    
+    sendto(socket_, response.data(), response.size(), 0,
+           (sockaddr*)&client_addr, sizeof(client_addr));
+    
+    std::cout << "Sent CONNECTED_PONG (0x85) response" << std::endl;
+    logHex(response.data(), response.size(), "PONG: ");
+}
+
+void RakNetServer::handleConnectedPong(sockaddr_in client_addr, uint8_t* buffer, size_t length) {
+    std::cout << "Received CONNECTED_PONG" << std::endl;
+    // Optional: Handle pong response if needed
 }
